@@ -4,7 +4,6 @@ import time
 import json
 import logging
 import requests
-import anthropic
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
@@ -39,7 +38,7 @@ class GCSConnector:
         self.gcs_api_base_url = "https://gcs.adobe.io/api/v1"
         
         # Anthropic API
-        self.anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         
         # Access token management
         self.access_token = None
@@ -180,23 +179,37 @@ class GCSConnector:
             raise
     
     def translate_with_anthropic(self, source_text, source_language, target_language):
-        """Uses Anthropic's Claude to translate text."""
+        """Uses Anthropic's Claude to translate text using direct API calls."""
         try:
+            headers = {
+                "x-api-key": self.anthropic_api_key,
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
             prompt = f"""Please translate the following text from {source_language} to {target_language}. 
             Provide only the translated text with no additional comments or explanations.
             
             Text to translate:
             {source_text}"""
             
-            response = self.anthropic_client.messages.create(
-                model="claude-3-haiku-20240307",
-                max_tokens=4000,
-                messages=[
+            data = {
+                "model": "claude-3-haiku-20240307",
+                "max_tokens": 4000,
+                "messages": [
                     {"role": "user", "content": prompt}
                 ]
-            )
+            }
             
-            return response.content[0].text
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data
+            )
+            response.raise_for_status()
+            
+            response_data = response.json()
+            return response_data["content"][0]["text"]
             
         except Exception as e:
             logger.error(f"Error translating with Anthropic: {e}")
@@ -249,8 +262,6 @@ class GCSConnector:
             logger.info(f"Re-translating asset {asset_name} from {source_locale} to {target_locale}")
             
             # For RE_TRANSLATE, we need to retrieve the specific asset with reviewer comments
-            # This might involve parsing the asset_url or fetching from a specific endpoint
-            
             # Get the asset content
             response = requests.get(asset_url)
             response.raise_for_status()
@@ -258,23 +269,38 @@ class GCSConnector:
             # The response format may vary; adjust as needed
             asset_content = response.text
             
-            # Translate the content using Anthropic with extra context about it being a revision
+            # Translate with Anthropic using direct API call
+            headers = {
+                "x-api-key": self.anthropic_api_key,
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
             prompt = f"""Please revise the following translation from {source_locale} to {target_locale}.
             This is a revision request, so please pay extra attention to accuracy and quality.
             
             Text to translate:
             {asset_content}"""
             
-            translated_content = self.anthropic_client.messages.create(
-                model="claude-3-haiku-20240307",
-                max_tokens=4000,
-                messages=[
+            data = {
+                "model": "claude-3-haiku-20240307",
+                "max_tokens": 4000,
+                "messages": [
                     {"role": "user", "content": prompt}
                 ]
-            ).content[0].text
+            }
             
-            # Put translated asset back (endpoint might be different for RE_TRANSLATE)
-            # For now, using the same endpoint as regular translation
+            api_response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data
+            )
+            api_response.raise_for_status()
+            
+            response_data = api_response.json()
+            translated_content = response_data["content"][0]["text"]
+            
+            # Put translated asset back
             self.put_asset(project_id, task_id, asset_name, translated_content)
             
             logger.info(f"Successfully re-translated and updated asset {asset_name}")
