@@ -39,9 +39,7 @@ class GCSConnector:
         self.gcs_api_base_url = "https://gcs.adobe.io/api/v1"
         
         # Anthropic API
-        self.anthropic_client = anthropic.Anthropic(
-            api_key=os.getenv("ANTHROPIC_API_KEY")
-        )
+        self.anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         
         # Access token management
         self.access_token = None
