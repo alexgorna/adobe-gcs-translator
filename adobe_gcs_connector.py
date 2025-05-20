@@ -365,7 +365,8 @@ class GCSConnector:
             # For regular text translation
             headers = {
                 "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json"
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"  # This is required for the API to work properly
             }
             
             prompt = f"""Please translate the following text from {source_language} to {target_language}. 
@@ -450,7 +451,8 @@ class GCSConnector:
             # Call Claude API
             headers = {
                 "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json"
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"  # This is required for the API to work properly
             }
             
             data = {
@@ -616,7 +618,8 @@ class GCSConnector:
             # Translate with Anthropic using direct API call
             headers = {
                 "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json"
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"  # This is required for the API to work properly
             }
             
             prompt = f"""Please revise the following translation from {source_locale} to {target_locale}.
