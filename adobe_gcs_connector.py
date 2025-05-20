@@ -96,10 +96,14 @@ class GCSConnector:
         if not url:
             return url
             
+        # Remove any leading/trailing whitespace
+        url = url.strip()
+        
         # Fix URLs that start with </events-fast/
-        if url.startswith("</events-fast/"):
-            url = url[2:]  # Remove the </ prefix
-            return f"https://events-va6.adobe.io/{url}"
+        if "</events-fast/" in url:
+            # Extract the actual path after </events-fast/
+            path = url.split("</events-fast/")[1]
+            return f"https://events-va6.adobe.io/events-fast/{path}"
             
         # Fix URLs that are missing the protocol and domain
         if not url.startswith("http"):
