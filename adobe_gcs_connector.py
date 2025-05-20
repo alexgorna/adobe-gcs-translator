@@ -307,10 +307,32 @@ class GCSConnector:
             
             if response.status_code not in (200, 201):
                 logger.info(f"Complete asset translation response body: {response.text[:500]}...")
-                response.raise_for_status()
+                
+                # Check if the error is about TRANSLATION_READY state
+                if "TRANSLATION_READY" in response.text:
+                    # First update the asset state to IN_TRANSLATION
+                    update_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}"
+                    update_payload = {
+                        "locale": target_locale,
+                        "status": "IN_TRANSLATION"
+                    }
+                    
+                    logger.info(f"Updating asset state to IN_TRANSLATION: {update_url}")
+                    update_response = requests.put(update_url, headers=headers, json=update_payload)
+                    
+                    if update_response.status_code in (200, 201, 204):
+                        logger.info("Successfully updated asset state, trying completion again")
+                        # Try the completion again
+                        response = requests.put(url, headers=headers, json=payload)
+                        response.raise_for_status()
+                    else:
+                        logger.error(f"Error updating asset state: {update_response.status_code} - {update_response.text}")
+                        response.raise_for_status()
+                else:
+                    response.raise_for_status()
             
             # Parse the response
-            completion_data = response.json()
+            completion_data = response.json() if response.text else {"status": "completed"}
             logger.info("Successfully completed asset translation")
             
             return completion_data
