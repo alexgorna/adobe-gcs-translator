@@ -278,14 +278,39 @@ class GCSConnector:
         PUT /v1/projects/{project}/tasks/{task}/assets/{asset}/locales/{locale}/complete
         """
         try:
-            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}/complete"
-            logger.info(f"Completing asset translation: {url}")
+            # First check and update the asset state if needed
+            update_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}"
+            update_headers = self.get_auth_headers()
+            update_headers["Content-Type"] = "application/json"
             
-            headers = self.get_auth_headers()
-            headers["Content-Type"] = "application/json"
+            # Prepare the update payload
+            update_payload = {
+                "locale": target_locale,
+                "orgId": self.ims_org_id,
+                "tenantId": tenant_id,  # Added based on documentation
+                "status": "IN_TRANSLATION"
+            }
+            
+            logger.info(f"Updating asset state to IN_TRANSLATION: {update_url}")
+            update_response = requests.put(update_url, headers=update_headers, json=update_payload)
+            
+            # Log the update response for debugging
+            logger.info(f"Update asset state response status: {update_response.status_code}")
+            if update_response.status_code not in (200, 201, 204):
+                logger.error(f"Error updating asset state: {update_response.status_code} - {update_response.text}")
+                update_response.raise_for_status()
+            else:
+                logger.info("Successfully updated asset state to IN_TRANSLATION")
+            
+            # Now proceed with the completion
+            complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}/complete"
+            logger.info(f"Completing asset translation: {complete_url}")
+            
+            complete_headers = self.get_auth_headers()
+            complete_headers["Content-Type"] = "application/json"
             
             # Prepare the request payload exactly as specified in the documentation
-            payload = {
+            complete_payload = {
                 "assetName": asset_name,
                 "tenantId": tenant_id,
                 "orgId": self.ims_org_id,
@@ -300,41 +325,18 @@ class GCSConnector:
                 }
             }
             
-            # Make the request
-            response = requests.put(url, headers=headers, json=payload)
+            # Make the completion request
+            complete_response = requests.put(complete_url, headers=complete_headers, json=complete_payload)
             
             # Log the response for debugging
-            logger.info(f"Complete asset translation response status: {response.status_code}")
+            logger.info(f"Complete asset translation response status: {complete_response.status_code}")
             
-            if response.status_code not in (200, 201):
-                logger.info(f"Complete asset translation response body: {response.text[:500]}...")
-                
-                # Check if the error is about TRANSLATION_READY state
-                if "TRANSLATION_READY" in response.text:
-                    # First update the asset state to IN_TRANSLATION
-                    update_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}"
-                    update_payload = {
-                        "locale": target_locale,
-                        "orgId": self.ims_org_id,
-                        "status": "IN_TRANSLATION"
-                    }
-                    
-                    logger.info(f"Updating asset state to IN_TRANSLATION: {update_url}")
-                    update_response = requests.put(update_url, headers=headers, json=update_payload)
-                    
-                    if update_response.status_code in (200, 201, 204):
-                        logger.info("Successfully updated asset state, trying completion again")
-                        # Try the completion again
-                        response = requests.put(url, headers=headers, json=payload)
-                        response.raise_for_status()
-                    else:
-                        logger.error(f"Error updating asset state: {update_response.status_code} - {update_response.text}")
-                        response.raise_for_status()
-                else:
-                    response.raise_for_status()
+            if complete_response.status_code not in (200, 201):
+                logger.info(f"Complete asset translation response body: {complete_response.text[:500]}...")
+                complete_response.raise_for_status()
             
             # Parse the response
-            completion_data = response.json() if response.text else {"status": "completed"}
+            completion_data = complete_response.json() if complete_response.text else {"status": "completed"}
             logger.info("Successfully completed asset translation")
             
             return completion_data
