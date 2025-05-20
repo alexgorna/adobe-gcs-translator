@@ -646,7 +646,7 @@ class GCSConnector:
             preview_text = source_text[:100] + "..." if len(source_text) > 100 else source_text
             logger.info(f"Translating text with Anthropic", 
                        extra={"action": "translate",
-                              "Translation input: preview_text,
+                              "translation_input": preview_text,
                               "source_language": source_language, 
                               "target_language": target_language,
                               "text_length": len(source_text)})
