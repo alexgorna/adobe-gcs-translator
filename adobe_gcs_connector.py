@@ -5,9 +5,9 @@ import json
 import logging
 import requests
 import re
-import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
 
 # Setup logging
 logging.basicConfig(
@@ -37,7 +37,7 @@ class GCSConnector:
         self.journaling_endpoint = os.getenv("ADOBE_JOURNALING_ENDPOINT")
         
         # GCS API endpoints
-        self.gcs_api_base_url = "https://gcs.adobe.io/api/v1"
+        self.gcs_api_base_url = "https://gcs.adobe.io/v1"
         
         # Anthropic API
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -165,212 +165,406 @@ class GCSConnector:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error polling for events: {e}")
     
-    def get_asset(self, project_id, task_id, asset_id=None):
-        """Retrieves an asset from GCS using the correct API approach."""
+    def get_assets(self, project_id, task_id, target_locale, tenant_id):
+        """
+        Gets assets information using the Get All Assets API.
+        
+        As per documentation:
+        GET /v1/projects/{project}/tasks/{task}/assets/{targetLocale}?tenantId={tenantId}
+        """
         try:
-            # First, try to get the asset using the URL directly from the event
-            if hasattr(self, 'current_event') and self.current_event.get("url"):
-                direct_url = self.current_event.get("url")
-                logger.info(f"Using direct URL from event: {direct_url}")
-                
-                # Try to access the direct URL
-                headers = self.get_auth_headers()
-                response = requests.get(direct_url, headers=headers)
-                
-                # Log response details
-                logger.info(f"Direct URL response status: {response.status_code}")
-                if response.status_code == 200:
-                    # If successful, return as a single asset
-                    return [{"id": "main", "content": response.text}]
-                else:
-                    logger.info(f"Direct URL response body: {response.text[:500]}...")
-            
-            # If direct URL fails or isn't available, try getting asset metadata first
-            # The documentation suggests we need to get asset URLs from metadata
-            asset_metadata_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}"
-            logger.info(f"Getting asset metadata from: {asset_metadata_url}")
-            
-            headers = self.get_auth_headers()
-            metadata_response = requests.get(asset_metadata_url, headers=headers)
-            metadata_response.raise_for_status()
-            
-            # Parse the metadata to get asset URLs
-            metadata = metadata_response.json()
-            logger.info(f"Got task metadata with keys: {list(metadata.keys())}")
-            
-            # Look for assetUrls or similar fields in the metadata
-            # This depends on the exact API response structure
-            asset_urls = []
-            
-            # Check various possible locations for asset URLs based on documentation
-            if "assetUrls" in metadata:
-                asset_urls = [url_info.get("url") for url_info in metadata.get("assetUrls", []) if url_info.get("url")]
-            elif "assets" in metadata:
-                assets_info = metadata.get("assets", [])
-                for asset_info in assets_info:
-                    if "url" in asset_info:
-                        asset_urls.append(asset_info["url"])
-                    elif "assetUrls" in asset_info:
-                        for url_info in asset_info.get("assetUrls", []):
-                            if url_info.get("url"):
-                                asset_urls.append(url_info["url"])
-            
-            # If we found asset URLs, try to download each one
-            if asset_urls:
-                logger.info(f"Found {len(asset_urls)} asset URLs in metadata")
-                assets = []
-                
-                for i, asset_url in enumerate(asset_urls):
-                    try:
-                        url_response = requests.get(asset_url, headers=headers)
-                        url_response.raise_for_status()
-                        
-                        # Add as an asset with an index-based ID
-                        asset_id = asset_id or f"asset_{i}"
-                        assets.append({
-                            "id": asset_id,
-                            "content": url_response.text
-                        })
-                        
-                        logger.info(f"Successfully downloaded asset content from {asset_url}")
-                    except Exception as url_e:
-                        logger.error(f"Error downloading asset from URL {asset_url}: {url_e}")
-                
-                if assets:
-                    return assets
-                    
-            # If all else fails, try the original assets endpoint
-            if asset_id:
-                url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_id}"
-            else:
-                url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets"
-                
-            logger.info(f"Falling back to standard assets endpoint: {url}")
+            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{target_locale}?tenantId={tenant_id}"
+            logger.info(f"Getting assets from: {url}")
             
             headers = self.get_auth_headers()
             response = requests.get(url, headers=headers)
             
             # Log the response for debugging
-            logger.info(f"Asset API response status: {response.status_code}")
-            if response.status_code != 200:
-                logger.info(f"Asset API response body: {response.text[:500]}...")
-                
-            response.raise_for_status()
+            logger.info(f"Get assets response status: {response.status_code}")
             
-            return response.json()
+            if response.status_code != 200:
+                logger.info(f"Get assets response body: {response.text[:500]}...")
+                response.raise_for_status()
+            
+            # Parse the response
+            assets_data = response.json()
+            logger.info(f"Successfully retrieved assets information")
+            
+            # Return the response which contains the assets information
+            return assets_data.get("response", [])
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting asset: {e}")
-            
-            # If all attempts fail, create a dummy asset for testing
-            logger.info("Creating a dummy asset for testing purposes")
-            return [{
-                "id": "dummy_asset",
-                "content": "This is a placeholder text for translation testing. The actual content could not be retrieved."
-            }]
+            logger.error(f"Error getting assets: {e}")
+            raise
     
-    def put_asset(self, project_id, task_id, asset_id, translated_content):
-        """Puts a translated asset back to GCS using the documented API format."""
+    def get_asset_content(self, tenant_id, object_key):
+        """
+        Downloads asset content using the asset content API.
+        
+        As per documentation:
+        GET /v1/assetContent?tenantId={tenantId}&objectKey={objectKey}
+        """
         try:
-            target_locale = self.current_target_locale
-            tenant_id = self.current_tenant_id
+            url = f"{self.gcs_api_base_url}/assetContent?tenantId={tenant_id}&objectKey={object_key}"
+            logger.info(f"Getting asset content from: {url}")
             
-            if not target_locale or not tenant_id:
-                logger.error("Missing target_locale or tenant_id for put_asset")
-                raise ValueError("Missing required parameters for put_asset")
+            headers = self.get_auth_headers()
+            response = requests.get(url, headers=headers)
             
-            # Use the documented API format that includes targetLocale in the URL
-            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{target_locale}/complete?tenantId={tenant_id}"
-            logger.info(f"Using documented asset completion API format: {url}")
+            # Log the response for debugging
+            logger.info(f"Get asset content response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.info(f"Get asset content response body: {response.text[:500]}...")
+                response.raise_for_status()
+            
+            # Return the content which should be the XLIFF file
+            return response.text
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error getting asset content: {e}")
+            raise
+    
+    def upload_translated_content(self, tenant_id, translated_content, file_name="translated.xlf"):
+        """
+        Uploads translated content to GCS Azure Storage.
+        
+        As per documentation:
+        POST /v1/uploadToStorage
+        """
+        try:
+            url = f"{self.gcs_api_base_url}/uploadToStorage"
+            logger.info(f"Uploading translated content to: {url}")
+            
+            headers = self.get_auth_headers()
+            # Don't include Content-Type as requests will set it with the proper boundary
+            
+            # Prepare the file for multipart/form-data
+            files = {
+                'file': (file_name, translated_content, 'application/octet-stream')
+            }
+            
+            # Add the tenantId as form field
+            data = {
+                'tenantId': tenant_id
+            }
+            
+            # Make the request
+            response = requests.post(url, headers=headers, files=files, data=data)
+            
+            # Log the response for debugging
+            logger.info(f"Upload translated content response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.info(f"Upload translated content response body: {response.text[:500]}...")
+                response.raise_for_status()
+            
+            # Parse the response to get the URL of the uploaded file
+            upload_data = response.json()
+            logger.info("Successfully uploaded translated content")
+            
+            # Return the URL where the translated content was uploaded
+            return upload_data.get("response")
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error uploading translated content: {e}")
+            raise
+    
+    def complete_asset_translation(self, project_id, task_id, asset_name, target_locale, tenant_id, translated_url):
+        """
+        Completes the asset translation by calling the asset locale completion API.
+        
+        As per documentation:
+        PUT /v1/projects/{project}/tasks/{task}/assets/{asset}/locales/{locale}/complete
+        """
+        try:
+            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}/complete"
+            logger.info(f"Completing asset translation: {url}")
             
             headers = self.get_auth_headers()
             headers["Content-Type"] = "application/json"
             
-            # Format the completion request according to documentation
-            data = {
-                "assetName": asset_id,
+            # Prepare the request payload exactly as specified in the documentation
+            payload = {
+                "assetName": asset_name,
                 "tenantId": tenant_id,
                 "targetAssetLocale": {
                     "locale": target_locale,
                     "status": "TRANSLATED"
                 },
-                "targetAssetContent": translated_content
+                "targetAssetUrl": {
+                    "locale": target_locale,
+                    "url": translated_url,
+                    "urlType": "TRANSLATED"
+                }
             }
             
-            # Log request details
-            logger.info(f"Putting translated asset to: {url}")
+            # Make the request
+            response = requests.put(url, headers=headers, json=payload)
             
-            response = requests.put(url, headers=headers, json=data)
+            # Log the response for debugging
+            logger.info(f"Complete asset translation response status: {response.status_code}")
             
-            # Log response for debugging
-            logger.info(f"Put asset response status: {response.status_code}")
-            if response.status_code >= 400:
-                logger.info(f"Put asset response body: {response.text[:500]}...")
-            else:
-                logger.info("Successfully completed asset translation")
-                
-            response.raise_for_status()
+            if response.status_code not in (200, 201):
+                logger.info(f"Complete asset translation response body: {response.text[:500]}...")
+                response.raise_for_status()
             
-            return response.json()
+            # Parse the response
+            completion_data = response.json()
+            logger.info("Successfully completed asset translation")
+            
+            return completion_data
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error putting asset: {e}")
-            
-            # Try using the serviceBaseUrl if available
-            try:
-                if hasattr(self, 'current_event') and self.current_event.get("serviceBaseUrl"):
-                    service_base_url = self.current_event.get("serviceBaseUrl")
-                    logger.info(f"Trying to complete with serviceBaseUrl: {service_base_url}")
-                    
-                    # Try the completion endpoint with serviceBaseUrl
-                    url = f"{service_base_url}/api/v1/projects/{project_id}/tasks/{task_id}/assets/{target_locale}/complete?tenantId={tenant_id}"
-                    
-                    response = requests.put(url, headers=headers, json=data)
-                    
-                    logger.info(f"Service URL completion status: {response.status_code}")
-                    if response.status_code < 400:
-                        logger.info("Successfully completed asset using serviceBaseUrl")
-                        return response.json() if response.text else {"status": "success"}
-            except Exception as service_e:
-                logger.error(f"Error using serviceBaseUrl for completion: {service_e}")
-                
-            # If all else fails, try to at least mark the task as complete
-            try:
-                complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/complete?tenantId={tenant_id}"
-                logger.info(f"Attempting to mark task as complete: {complete_url}")
-                
-                complete_data = {
-                    "tenantId": tenant_id,
-                    "status": "COMPLETED"
-                }
-                
-                response = requests.put(complete_url, headers=headers, json=complete_data)
-                if response.status_code < 400:
-                    logger.info("Successfully marked task as complete")
-                    return {"status": "task marked complete"}
-                else:
-                    logger.info(f"Task completion failed: {response.status_code} - {response.text[:500]}")
-            except Exception as complete_e:
-                logger.error(f"Error trying to mark task as complete: {complete_e}")
-            
+            logger.error(f"Error completing asset translation: {e}")
             raise
     
-    def translate_with_anthropic(self, source_text, source_language, target_language):
-        """Uses Anthropic's Claude to translate text with an improved prompt to avoid markers in the output."""
+    def complete_task(self, project_id, task_id, tenant_id):
+        """
+        Marks the entire translation task as complete.
+        
+        As per documentation:
+        PUT /v1/projects/{project}/tasks/{task}/complete?tenantId={tenantId}
+        """
         try:
-            # Check if the text appears to be XLIFF
-            if source_text.strip().startswith('<?xml') and ('<xliff' in source_text or '<trans-unit' in source_text):
-                return self.translate_xliff_with_anthropic(source_text, source_language, target_language)
+            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/complete?tenantId={tenant_id}"
+            logger.info(f"Marking task as complete: {url}")
             
-            # For regular text translation
+            headers = self.get_auth_headers()
+            headers["Content-Type"] = "application/json"
+            
+            # Prepare the request payload
+            payload = {
+                "tenantId": tenant_id,
+                "status": "COMPLETED"
+            }
+            
+            # Make the request
+            response = requests.put(url, headers=headers, json=payload)
+            
+            # Log the response for debugging
+            logger.info(f"Complete task response status: {response.status_code}")
+            
+            if response.status_code not in (200, 201, 204):
+                logger.info(f"Complete task response body: {response.text[:500]}...")
+                response.raise_for_status()
+            
+            logger.info("Successfully marked task as complete")
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error completing task: {e}")
+            return False
+    
+    def translate_xliff_with_anthropic(self, xliff_content, source_language, target_language):
+        """
+        Enhanced XLIFF translation that captures all translatable elements including
+        headers, titles, and other special elements that might be missed by simpler methods.
+        """
+        try:
+            # Parse the XLIFF file
+            root = ET.fromstring(xliff_content)
+            
+            # Store all namespaces for proper handling
+            namespaces = {}
+            for prefix, uri in root.nsmap.items() if hasattr(root, 'nsmap') else []:
+                namespaces[prefix] = uri
+            
+            # List to store all found translatable elements
+            translatable_elements = []
+            
+            # Find all possible translatable elements using various search methods
+            
+            # 1. Standard trans-units (most common case)
+            trans_units = []
+            for element in root.findall('.//*'):
+                if element.tag.endswith('trans-unit'):
+                    trans_units.append(element)
+            
+            # 2. Look for header elements (often missed)
+            header_elements = []
+            for element in root.findall('.//*'):
+                tag = element.tag.lower()
+                if any(x in tag for x in ['title', 'header', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                    header_elements.append(element)
+            
+            # 3. Check for elements with translatable attribute
+            translatable_attr_elements = []
+            for element in root.findall('.//*[@translatable="yes"]'):
+                translatable_attr_elements.append(element)
+            
+            # 4. Check resname attribute for clues about content type
+            resname_elements = []
+            for element in root.findall('.//*[@resname]'):
+                resname = element.get('resname', '').lower()
+                if any(x in resname for x in ['title', 'header', 'heading']):
+                    resname_elements.append(element)
+            
+            # Combine all found elements but eliminate duplicates
+            all_elements = []
+            for elem in trans_units + header_elements + translatable_attr_elements + resname_elements:
+                if elem not in all_elements:
+                    all_elements.append(elem)
+            
+            logger.info(f"Found {len(all_elements)} potentially translatable elements in XLIFF file")
+            
+            # Extract text to translate
+            translation_items = []
+            
+            for i, element in enumerate(all_elements):
+                # For each element, find source and possibly target elements
+                source = None
+                target = None
+                element_type = "unknown"
+                
+                # Check if this is a trans-unit
+                if element.tag.endswith('trans-unit'):
+                    element_type = "trans-unit"
+                    # Find the source element
+                    for child in element:
+                        if child.tag.endswith('source'):
+                            source = child
+                        elif child.tag.endswith('target'):
+                            target = child
+                
+                # If it's another type of element, the element itself might be translatable
+                else:
+                    element_type = "direct"
+                    source = element
+                
+                # Extract text from source if found
+                source_text = ""
+                if source is not None:
+                    # Get text content, including text from child elements
+                    source_text = ''.join(source.itertext()) if hasattr(source, 'itertext') else (source.text or "")
+                    source_text = source_text.strip()
+                
+                # Only add non-empty items for translation
+                if source_text:
+                    translation_items.append((i, element_type, element, source, target, source_text))
+            
+            logger.info(f"Extracted {len(translation_items)} items for translation")
+            
+            # If we found translation items, process them
+            if translation_items:
+                # Combine all texts for a single translation request with clear markers
+                combined_text = "\n---ITEM---\n".join([
+                    f"[ITEM-{i}][{element_type.upper()}] {text}" 
+                    for i, element_type, _, _, _, text in translation_items
+                ])
+                
+                # Translate using Anthropic
+                translated_combined = self.translate_with_anthropic(combined_text, source_language, target_language)
+                
+                # Split the translated text back into individual items
+                # First find the separator pattern
+                split_pattern = "\n---ITEM---\n"
+                if split_pattern not in translated_combined:
+                    # Try alternate patterns if the expected one isn't found
+                    possible_patterns = [
+                        "\n---ITEM---\n", "\n- - -ITEM- - -\n", "\n--ITEM--\n", 
+                        "\n---\n", "\n- - -\n", "\n--\n", "\n\n", "\n"
+                    ]
+                    for pattern in possible_patterns:
+                        if pattern in translated_combined:
+                            split_pattern = pattern
+                            break
+                
+                # Split by the identified pattern
+                translated_parts = translated_combined.split(split_pattern)
+                
+                # Clean up the parts and remove any markers
+                cleaned_parts = []
+                for part in translated_parts:
+                    part = part.strip()
+                    # Remove item markers like [ITEM-0][TRANS-UNIT]
+                    part = re.sub(r'\[ITEM-\d+\]\[\w+\]\s*', '', part)
+                    cleaned_parts.append(part)
+                
+                # If we don't have enough parts, repeat the last one or add placeholders
+                while len(cleaned_parts) < len(translation_items):
+                    cleaned_parts.append(cleaned_parts[-1] if cleaned_parts else "")
+                
+                # If we have too many parts, truncate
+                if len(cleaned_parts) > len(translation_items):
+                    cleaned_parts = cleaned_parts[:len(translation_items)]
+                
+                # Update the XLIFF with translations
+                for idx, (i, element_type, element, source, target, _) in enumerate(translation_items):
+                    if idx < len(cleaned_parts):
+                        translated_text = cleaned_parts[idx].strip()
+                        
+                        # Skip if the translation is empty
+                        if not translated_text:
+                            continue
+                        
+                        # Different handling based on element type
+                        if element_type == "trans-unit":
+                            # If we have a target element, update it
+                            if target is not None:
+                                target.text = translated_text
+                            else:
+                                # Create a new target element
+                                namespace = source.tag.rsplit('}', 1)[0] + '}' if '}' in source.tag else ""
+                                target_tag = namespace + 'target' if namespace else 'target'
+                                
+                                # Create new element with correct namespace
+                                new_target = ET.Element(target_tag)
+                                new_target.text = translated_text
+                                
+                                # Copy xml:lang attribute from source if it exists
+                                if '{http://www.w3.org/XML/1998/namespace}lang' in source.attrib:
+                                    new_target.attrib['{http://www.w3.org/XML/1998/namespace}lang'] = target_language
+                                
+                                # Add the new target element to the trans-unit
+                                element.append(new_target)
+                        
+                        # For direct elements, update the element's text directly
+                        elif element_type == "direct":
+                            element.text = translated_text
+            
+            # Convert the modified XML back to a string
+            # Use the native tostring method with careful encoding
+            if hasattr(ET, 'ElementTree'):
+                tree = ET.ElementTree(root)
+                # Use encoding='unicode' for Python 3.2+
+                try:
+                    translated_xliff = ET.tostring(root, encoding='unicode', method='xml')
+                except TypeError:
+                    # Fallback for older versions
+                    translated_xliff = ET.tostring(root, encoding='utf-8', method='xml').decode('utf-8')
+            else:
+                # Basic fallback
+                translated_xliff = ET.tostring(root, encoding='utf-8', method='xml').decode('utf-8')
+            
+            # Return the translated XLIFF
+            return translated_xliff
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Error translating XLIFF with Anthropic: {e}")
+            logger.error(traceback.format_exc())
+            # If there's an error, return the original content
+            return xliff_content
+    
+    def translate_with_anthropic(self, source_text, source_language, target_language):
+        """Uses Anthropic's Claude to translate text using direct API calls."""
+        try:
             headers = {
                 "x-api-key": self.anthropic_api_key,
                 "content-type": "application/json",
-                "anthropic-version": "2023-06-01"  # This is required for the API to work properly
+                "anthropic-version": "2023-06-01"
             }
             
             prompt = f"""Please translate the following text from {source_language} to {target_language}. 
-            Provide ONLY the translated text with no additional comments, explanations, or markers.
+            Provide ONLY the translated text with NO additional comments or explanations.
+            
+            IMPORTANT: 
+            - Preserve any markers like [ITEM-0][TRANS-UNIT] in your translation
+            - Maintain the exact same format and structure
+            - Translate all content, including titles and headings
+            - Keep any HTML tags intact
+            - Do not add any extra text or explanations
             
             Text to translate:
             {source_text}"""
@@ -391,266 +585,160 @@ class GCSConnector:
             response.raise_for_status()
             
             response_data = response.json()
-            translated_text = response_data["content"][0]["text"].strip()
-            
-            return translated_text
+            return response_data["content"][0]["text"]
             
         except Exception as e:
             logger.error(f"Error translating with Anthropic: {e}")
             raise
     
-    def translate_xliff_with_anthropic(self, xliff_content, source_language, target_language):
-        """Translates XLIFF content using Anthropic's Claude with improved handling to avoid markers."""
-        try:
-            # Parse the XLIFF document
-            try:
-                root = ET.fromstring(xliff_content)
-                namespace = {'xliff': 'urn:oasis:names:tc:xliff:document:1.2'}
-            except Exception as e:
-                logger.error(f"Error parsing XLIFF content: {e}")
-                # Return original content if parsing fails
-                return xliff_content
-                
-            # Find all trans-unit elements
-            trans_units = []
-            for file_elem in root.findall('.//xliff:file', namespace):
-                for trans_unit in file_elem.findall('.//xliff:trans-unit', namespace):
-                    trans_units.append(trans_unit)
-                    
-            logger.info(f"Found {len(trans_units)} translation units in XLIFF file")
+    def extract_object_key_from_url(self, url):
+        """
+        Extract the object key from an asset URL.
+        
+        Example URL format:
+        https://<Storage Account Name>.blob.core.windows.net/gcs/<tenant_id>/<ProjectId>/<TaskId>/normalized/<AssetName>/en-US/<AssetName>.xlf
+        
+        Object key format:
+        <tenant_id>/<ProjectId>/<TaskId>/normalized/<AssetName>/en-US/<AssetName>.xlf
+        """
+        # This is a simplistic approach - in production, URL parsing would be more robust
+        if "blob.core.windows.net/gcs/" in url:
+            # Split by the common prefix and take everything after it
+            object_key = url.split("blob.core.windows.net/gcs/")[1]
             
-            if not trans_units:
-                logger.warning("No translation units found in XLIFF")
-                return xliff_content
-                
-            # Extract text for translation
-            texts_to_translate = []
-            for i, unit in enumerate(trans_units):
-                source_elem = unit.find('.//xliff:source', namespace)
-                if source_elem is not None and source_elem.text:
-                    texts_to_translate.append({
-                        "id": i,
-                        "text": source_elem.text
-                    })
+            # Remove any query parameters
+            if "?" in object_key:
+                object_key = object_key.split("?")[0]
             
-            if not texts_to_translate:
-                logger.warning("No text content found for translation")
-                return xliff_content
-                
-            # Prepare the segments for translation
-            prompt = f"""Translate the following text segments from {source_language} to {target_language}.
-            
-            For each segment, provide ONLY the translation without any additional text, markers, or formatting.
-            
-            Here are the segments:
-            """
-            
-            for segment in texts_to_translate:
-                prompt += f"\n\nSegment {segment['id']}:\n{segment['text']}"
-            
-            # Call Claude API
-            headers = {
-                "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"  # This is required for the API to work properly
-            }
-            
-            data = {
-                "model": "claude-3-haiku-20240307",
-                "max_tokens": 4000,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
-            
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=data
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
-                return xliff_content
-                
-            response_data = response.json()
-            translated_text = response_data["content"][0]["text"]
-            
-            # Process Claude's response to extract translations
-            for i, unit in enumerate(trans_units):
-                if i >= len(texts_to_translate):
-                    break
-                    
-                # Look for the segment in Claude's response
-                pattern = re.compile(rf"Segment\s*{i}:?\s*(.*?)(?=Segment\s*\d+:|$)", re.DOTALL)
-                match = pattern.search(translated_text)
-                
-                if match:
-                    # Clean up the translation
-                    translation = match.group(1).strip()
-                    
-                    # Update or create the target element
-                    target_elem = unit.find('.//xliff:target', namespace)
-                    if target_elem is None:
-                        # Create a new target element
-                        source_elem = unit.find('.//xliff:source', namespace)
-                        if source_elem is not None:
-                            target_elem = ET.SubElement(unit, '{urn:oasis:names:tc:xliff:document:1.2}target')
-                            if 'xml:lang' in source_elem.attrib:
-                                target_elem.set('xml:lang', target_language)
-                    
-                    # Set the translated text
-                    if target_elem is not None:
-                        target_elem.text = translation
-            
-            # Convert the modified XML back to string
-            translated_xliff = ET.tostring(root, encoding='utf-8').decode('utf-8')
-            return translated_xliff
-            
-        except Exception as e:
-            logger.error(f"Error in XLIFF translation: {e}")
-            # Return original content as fallback
-            return xliff_content
+            return object_key
+        
+        # If the URL doesn't match the expected format, return the full URL as fallback
+        logger.warning(f"Could not extract object key from URL: {url}")
+        return url
     
     def handle_translate_event(self, event):
-        """Handles a TRANSLATE event."""
+        """
+        Handles a TRANSLATE event by following the Adobe GCS translation workflow:
+        1. Get assets information
+        2. Download the XLIFF file
+        3. Translate the XLIFF content
+        4. Upload the translated XLIFF
+        5. Complete the asset translation
+        6. Mark the task as complete
+        """
         try:
-            # Store current event context for use in error handling
-            self.current_event = event
-            self.current_tenant_id = event.get("tenantId")
-            self.current_target_locale = event.get("targetLocale")
-            
+            # Extract information from the event
             project_id = event.get("projectId")
             task_id = event.get("taskId")
             source_locale = event.get("sourceLocale")
             target_locale = event.get("targetLocale")
+            tenant_id = event.get("tenantId")
             
             logger.info(f"Processing TRANSLATE event - Project: {project_id}, Task: {task_id}")
             logger.info(f"Translating from {source_locale} to {target_locale}")
             
-            # Log the full event for debugging
-            logger.info(f"Event data: {json.dumps(event)}")
-            
-            # Get assets for the task
-            assets = self.get_asset(project_id, task_id)
+            # Step 1: Get assets information
+            assets = self.get_assets(project_id, task_id, target_locale, tenant_id)
             logger.info(f"Retrieved {len(assets)} assets for translation")
             
+            if not assets:
+                logger.warning("No assets found for translation")
+                return
+            
             for asset in assets:
-                asset_id = asset.get("id")
-                source_content = asset.get("content")
+                asset_name = asset.get("name")
+                logger.info(f"Processing asset: {asset_name}")
                 
-                if not source_content:
-                    logger.warning(f"Asset {asset_id} has no content to translate")
+                # Find the NORMALIZED URL from assetUrls
+                normalized_url = None
+                asset_urls = asset.get("assetUrls", [])
+                
+                for url_info in asset_urls:
+                    if url_info.get("urlType") == "NORMALIZED" and url_info.get("locale") == source_locale:
+                        normalized_url = url_info.get("url")
+                        break
+                
+                if not normalized_url:
+                    logger.warning(f"No NORMALIZED URL found for asset {asset_name}")
                     continue
                 
-                # Translate the content using Anthropic
-                translated_content = self.translate_with_anthropic(
-                    source_content, 
-                    source_locale, 
-                    target_locale
+                # Extract the object key from the normalized URL
+                object_key = self.extract_object_key_from_url(normalized_url)
+                logger.info(f"Extracted object key: {object_key}")
+                
+                # Step 2: Download the XLIFF content
+                xliff_content = self.get_asset_content(tenant_id, object_key)
+                logger.info(f"Retrieved XLIFF content of length: {len(xliff_content)}")
+                
+                # Step 3: Translate the XLIFF content
+                translated_xliff = self.translate_xliff_with_anthropic(xliff_content, source_locale, target_locale)
+                logger.info(f"Translated XLIFF content of length: {len(translated_xliff)}")
+                
+                # Step 4: Upload the translated XLIFF
+                file_name = f"{asset_name}_{target_locale}.xlf"
+                translated_url = self.upload_translated_content(tenant_id, translated_xliff, file_name)
+                logger.info(f"Uploaded translated content to: {translated_url}")
+                
+                # Step 5: Complete the asset translation
+                completion_result = self.complete_asset_translation(
+                    project_id, task_id, asset_name, target_locale, tenant_id, translated_url
                 )
-                
-                # Put translated asset back
-                self.put_asset(project_id, task_id, asset_id, translated_content)
-                
-                logger.info(f"Successfully translated and updated asset {asset_id}")
-                
+                logger.info(f"Completed asset translation: {completion_result}")
+            
+            # Step 6: Mark the entire task as complete
+            self.complete_task(project_id, task_id, tenant_id)
+            
         except Exception as e:
             logger.error(f"Error handling TRANSLATE event: {e}")
-            
-            # Try to mark the task as complete even if there was an error
-            try:
-                # If we have enough information, try to complete the task
-                if hasattr(self, 'current_event') and self.current_tenant_id and self.current_target_locale:
-                    project_id = self.current_event.get("projectId")
-                    task_id = self.current_event.get("taskId")
-                    
-                    if project_id and task_id:
-                        # Try using the task completion API
-                        complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/complete"
-                        logger.info(f"Attempting to complete task after error: {complete_url}")
-                        
-                        headers = self.get_auth_headers()
-                        headers["Content-Type"] = "application/json"
-                        
-                        complete_data = {
-                            "tenantId": self.current_tenant_id,
-                            "status": "COMPLETED"
-                        }
-                        
-                        response = requests.put(complete_url, headers=headers, json=complete_data)
-                        if response.status_code == 200:
-                            logger.info("Successfully marked task as complete despite errors")
-                        else:
-                            logger.info(f"Could not complete task: {response.status_code} - {response.text[:500]}")
-            except Exception as complete_e:
-                logger.error(f"Error trying to complete task after translation error: {complete_e}")
     
     def handle_retranslate_event(self, event):
-        """Handles a RE_TRANSLATE event."""
+        """
+        Handles a RE_TRANSLATE event following the same workflow as TRANSLATE
+        but using the specific asset URL from the event, and completing the task.
+        """
         try:
-            # Store current event context for error handling
-            self.current_event = event
-            self.current_tenant_id = event.get("tenantId")
-            self.current_target_locale = event.get("targetLocale")
-            
+            # Extract information from the event
             project_id = event.get("projectId")
             task_id = event.get("taskId")
             source_locale = event.get("sourceLocale")
             target_locale = event.get("targetLocale")
+            tenant_id = event.get("tenantId")
             asset_name = event.get("assetName")
             asset_url = event.get("assetUrl")
             
             logger.info(f"Processing RE_TRANSLATE event - Project: {project_id}, Task: {task_id}")
             logger.info(f"Re-translating asset {asset_name} from {source_locale} to {target_locale}")
             
-            # Log the full event for debugging
-            logger.info(f"RE_TRANSLATE event data: {json.dumps(event)}")
+            # For RE_TRANSLATE, we already have the asset URL in the event
+            if not asset_url:
+                logger.warning("No asset URL found in RE_TRANSLATE event")
+                return
             
-            # For RE_TRANSLATE, we need to retrieve the specific asset with reviewer comments
-            # Get the asset content
+            # Download the XLIFF content
+            # The asset_url is a direct download link, so we don't need to use the assetContent API
             response = requests.get(asset_url, headers=self.get_auth_headers())
             response.raise_for_status()
+            xliff_content = response.text
             
-            # The response format may vary; adjust as needed
-            asset_content = response.text
+            logger.info(f"Retrieved XLIFF content of length: {len(xliff_content)}")
             
-            # Translate with Anthropic using direct API call
-            headers = {
-                "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"  # This is required for the API to work properly
-            }
+            # Translate the XLIFF content
+            translated_xliff = self.translate_xliff_with_anthropic(xliff_content, source_locale, target_locale)
+            logger.info(f"Translated XLIFF content of length: {len(translated_xliff)}")
             
-            prompt = f"""Please revise the following translation from {source_locale} to {target_locale}.
-            This is a revision request, so please pay extra attention to accuracy and quality.
-            Provide ONLY the translated text with no additional comments, explanations, or markers.
+            # Upload the translated XLIFF
+            file_name = f"{asset_name}_{target_locale}.xlf"
+            translated_url = self.upload_translated_content(tenant_id, translated_xliff, file_name)
+            logger.info(f"Uploaded translated content to: {translated_url}")
             
-            Text to translate:
-            {asset_content}"""
-            
-            data = {
-                "model": "claude-3-haiku-20240307",
-                "max_tokens": 4000,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
-            
-            api_response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=data
+            # Complete the asset translation
+            completion_result = self.complete_asset_translation(
+                project_id, task_id, asset_name, target_locale, tenant_id, translated_url
             )
-            api_response.raise_for_status()
+            logger.info(f"Completed asset translation: {completion_result}")
             
-            response_data = api_response.json()
-            translated_content = response_data["content"][0]["text"].strip()
-            
-            # Put translated asset back
-            self.put_asset(project_id, task_id, asset_name, translated_content)
-            
-            logger.info(f"Successfully re-translated and updated asset {asset_name}")
+            # Mark the task as complete
+            self.complete_task(project_id, task_id, tenant_id)
             
         except Exception as e:
             logger.error(f"Error handling RE_TRANSLATE event: {e}")
