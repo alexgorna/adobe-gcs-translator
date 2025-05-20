@@ -318,44 +318,7 @@ class GCSConnector:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error completing asset translation: {e}")
             raise
-    
-    def complete_task(self, project_id, task_id, tenant_id):
-        """
-        Marks the entire translation task as complete.
-        
-        As per documentation:
-        PUT /v1/projects/{project}/tasks/{task}/complete?tenantId={tenantId}
-        """
-        try:
-            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/complete?tenantId={tenant_id}"
-            logger.info(f"Marking task as complete: {url}")
-            
-            headers = self.get_auth_headers()
-            headers["Content-Type"] = "application/json"
-            
-            # Prepare the request payload
-            payload = {
-                "tenantId": tenant_id,
-                "status": "COMPLETED"
-            }
-            
-            # Make the request
-            response = requests.put(url, headers=headers, json=payload)
-            
-            # Log the response for debugging
-            logger.info(f"Complete task response status: {response.status_code}")
-            
-            if response.status_code not in (200, 201, 204):
-                logger.info(f"Complete task response body: {response.text[:500]}...")
-                response.raise_for_status()
-            
-            logger.info("Successfully marked task as complete")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error completing task: {e}")
-            return False
-    
+     
     def translate_xliff_with_anthropic(self, xliff_content, source_language, target_language):
         """
         Enhanced XLIFF translation that captures all translatable elements including
@@ -685,8 +648,6 @@ class GCSConnector:
                 )
                 logger.info(f"Completed asset translation: {completion_result}")
             
-            # Step 6: Mark the entire task as complete
-            self.complete_task(project_id, task_id, tenant_id)
             
         except Exception as e:
             logger.error(f"Error handling TRANSLATE event: {e}")
@@ -736,9 +697,6 @@ class GCSConnector:
                 project_id, task_id, asset_name, target_locale, tenant_id, translated_url
             )
             logger.info(f"Completed asset translation: {completion_result}")
-            
-            # Mark the task as complete
-            self.complete_task(project_id, task_id, tenant_id)
             
         except Exception as e:
             logger.error(f"Error handling RE_TRANSLATE event: {e}")
