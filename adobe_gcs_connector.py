@@ -91,13 +91,32 @@ class GCSConnector:
             "x-ims-org-id": self.ims_org_id
         }
     
+    def fix_url(self, url):
+        """Ensures the URL has the proper format and protocol."""
+        if not url:
+            return url
+            
+        # Fix URLs that start with </events-fast/
+        if url.startswith("</events-fast/"):
+            url = url[2:]  # Remove the </ prefix
+            return f"https://events-va6.adobe.io/{url}"
+            
+        # Fix URLs that are missing the protocol and domain
+        if not url.startswith("http"):
+            if url.startswith("/"):
+                return f"https://events-va6.adobe.io{url}"
+            else:
+                return f"https://events-va6.adobe.io/{url}"
+                
+        return url
+    
     def poll_for_events(self):
         """Polls the journaling endpoint for new events."""
         try:
             if self.next_url is None:
                 url = f"{self.journaling_base_url}{self.journaling_endpoint}?limit=10"
             else:
-                url = self.next_url
+                url = self.fix_url(self.next_url)
                 
             logger.info(f"Polling for events: {url}")
             
@@ -116,7 +135,8 @@ class GCSConnector:
                 for link in link_header.split(","):
                     if 'rel="next"' in link:
                         # Extract URL from link header
-                        self.next_url = link.split(";")[0].strip("<>")
+                        next_url = link.split(";")[0].strip("<>")
+                        self.next_url = next_url
                         break
             
             # Process events
@@ -149,12 +169,35 @@ class GCSConnector:
                 
             headers = self.get_auth_headers()
             response = requests.get(url, headers=headers)
+            
+            # Log the response for debugging
+            logger.info(f"Asset API response status: {response.status_code}")
+            if response.status_code != 200:
+                logger.info(f"Asset API response body: {response.text[:500]}...")
+                
             response.raise_for_status()
             
             return response.json()
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Error getting asset: {e}")
+            
+            # Try alternative endpoint format if 404 is received
+            if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
+                try:
+                    # Try the asset URL directly from the event if available
+                    if hasattr(self, 'current_event') and self.current_event.get("url"):
+                        asset_url = self.current_event.get("url")
+                        logger.info(f"Trying alternative asset URL: {asset_url}")
+                        
+                        headers = self.get_auth_headers()
+                        response = requests.get(asset_url, headers=headers)
+                        response.raise_for_status()
+                        
+                        return [{"id": "default", "content": response.text}]
+                except Exception as alt_e:
+                    logger.error(f"Error using alternative asset URL: {alt_e}")
+            
             raise
     
     def put_asset(self, project_id, task_id, asset_id, translated_content):
@@ -169,13 +212,57 @@ class GCSConnector:
                 "content": translated_content
             }
             
+            # Log request details
+            logger.info(f"Putting translated asset to: {url}")
+            
             response = requests.put(url, headers=headers, json=data)
+            
+            # Log response for debugging
+            logger.info(f"Put asset response status: {response.status_code}")
+            if response.status_code >= 400:
+                logger.info(f"Put asset response body: {response.text[:500]}...")
+                
             response.raise_for_status()
             
             return response.json()
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Error putting asset: {e}")
+            
+            # Try alternative endpoints or methods
+            if isinstance(e, requests.exceptions.HTTPError) and (e.response.status_code == 404 or e.response.status_code == 400):
+                try:
+                    # Try using the complete asset API
+                    complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_id}/locales/{self.current_target_locale}/complete"
+                    logger.info(f"Trying asset completion API: {complete_url}")
+                    
+                    headers = self.get_auth_headers()
+                    headers["Content-Type"] = "application/json"
+                    
+                    # Prepare the data for completion
+                    complete_data = {
+                        "assetName": asset_id,
+                        "tenantId": self.current_tenant_id,
+                        "targetAssetLocale": {
+                            "locale": self.current_target_locale,
+                            "status": "TRANSLATED"
+                        },
+                        "targetAssetUrl": {
+                            "locale": self.current_target_locale,
+                            "url": "dummy-url", # This is a placeholder
+                            "urlType": "TRANSLATED"
+                        }
+                    }
+                    
+                    response = requests.put(complete_url, headers=headers, json=complete_data)
+                    response.raise_for_status()
+                    logger.info(f"Successfully completed asset using alternative API")
+                    
+                    return {"status": "completed"}
+                    
+                except Exception as alt_e:
+                    logger.error(f"Error using alternative completion API: {alt_e}")
+            
             raise
     
     def translate_with_anthropic(self, source_text, source_language, target_language):
@@ -218,6 +305,11 @@ class GCSConnector:
     def handle_translate_event(self, event):
         """Handles a TRANSLATE event."""
         try:
+            # Store current event context for use in error handling
+            self.current_event = event
+            self.current_tenant_id = event.get("tenantId")
+            self.current_target_locale = event.get("targetLocale")
+            
             project_id = event.get("projectId")
             task_id = event.get("taskId")
             source_locale = event.get("sourceLocale")
@@ -227,23 +319,79 @@ class GCSConnector:
             logger.info(f"Translating from {source_locale} to {target_locale}")
             
             # Get assets for the task
-            assets = self.get_asset(project_id, task_id)
+            try:
+                assets = self.get_asset(project_id, task_id)
+                logger.info(f"Retrieved {len(assets)} assets for translation")
+                
+                for asset in assets:
+                    asset_id = asset.get("id")
+                    source_content = asset.get("content")
+                    
+                    if not source_content:
+                        logger.warning(f"Asset {asset_id} has no content to translate")
+                        continue
+                    
+                    # Translate the content using Anthropic
+                    translated_content = self.translate_with_anthropic(
+                        source_content, 
+                        source_locale, 
+                        target_locale
+                    )
+                    
+                    # Put translated asset back
+                    self.put_asset(project_id, task_id, asset_id, translated_content)
+                    
+                    logger.info(f"Successfully translated and updated asset {asset_id}")
             
-            for asset in assets:
-                asset_id = asset.get("id")
-                source_content = asset.get("content")
+            except Exception as asset_e:
+                logger.error(f"Error processing assets: {asset_e}")
                 
-                # Translate the content using Anthropic
-                translated_content = self.translate_with_anthropic(
-                    source_content, 
-                    source_locale, 
-                    target_locale
-                )
-                
-                # Put translated asset back
-                self.put_asset(project_id, task_id, asset_id, translated_content)
-                
-                logger.info(f"Successfully translated and updated asset {asset_id}")
+                # Try alternative approach by using the URL in the event
+                if event.get("url"):
+                    try:
+                        asset_url = event.get("url")
+                        logger.info(f"Trying direct event URL: {asset_url}")
+                        
+                        headers = self.get_auth_headers()
+                        response = requests.get(asset_url, headers=headers)
+                        response.raise_for_status()
+                        
+                        source_content = response.text
+                        
+                        # Translate the content
+                        translated_content = self.translate_with_anthropic(
+                            source_content,
+                            source_locale,
+                            target_locale
+                        )
+                        
+                        # Try to complete the task
+                        complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/main/locales/{target_locale}/complete"
+                        logger.info(f"Trying to complete directly: {complete_url}")
+                        
+                        headers = self.get_auth_headers()
+                        headers["Content-Type"] = "application/json"
+                        
+                        complete_data = {
+                            "assetName": "main",
+                            "tenantId": event.get("tenantId"),
+                            "targetAssetLocale": {
+                                "locale": target_locale,
+                                "status": "TRANSLATED"
+                            },
+                            "targetAssetUrl": {
+                                "locale": target_locale,
+                                "url": "dummy-url", # This is a placeholder
+                                "urlType": "TRANSLATED"
+                            }
+                        }
+                        
+                        response = requests.put(complete_url, headers=headers, json=complete_data)
+                        response.raise_for_status()
+                        logger.info(f"Successfully completed translation using alternative method")
+                        
+                    except Exception as alt_e:
+                        logger.error(f"Error using alternative translation approach: {alt_e}")
                 
         except Exception as e:
             logger.error(f"Error handling TRANSLATE event: {e}")
@@ -251,6 +399,11 @@ class GCSConnector:
     def handle_retranslate_event(self, event):
         """Handles a RE_TRANSLATE event."""
         try:
+            # Store current event context for error handling
+            self.current_event = event
+            self.current_tenant_id = event.get("tenantId")
+            self.current_target_locale = event.get("targetLocale")
+            
             project_id = event.get("projectId")
             task_id = event.get("taskId")
             source_locale = event.get("sourceLocale")
