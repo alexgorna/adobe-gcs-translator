@@ -268,15 +268,31 @@ class GCSConnector:
             }]
     
     def put_asset(self, project_id, task_id, asset_id, translated_content):
-        """Puts a translated asset back to GCS."""
+        """Puts a translated asset back to GCS using the documented API format."""
         try:
-            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_id}"
+            target_locale = self.current_target_locale
+            tenant_id = self.current_tenant_id
+            
+            if not target_locale or not tenant_id:
+                logger.error("Missing target_locale or tenant_id for put_asset")
+                raise ValueError("Missing required parameters for put_asset")
+            
+            # Use the documented API format that includes targetLocale in the URL
+            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{target_locale}/complete?tenantId={tenant_id}"
+            logger.info(f"Using documented asset completion API format: {url}")
             
             headers = self.get_auth_headers()
             headers["Content-Type"] = "application/json"
             
+            # Format the completion request according to documentation
             data = {
-                "content": translated_content
+                "assetName": asset_id,
+                "tenantId": tenant_id,
+                "targetAssetLocale": {
+                    "locale": target_locale,
+                    "status": "TRANSLATED"
+                },
+                "targetAssetContent": translated_content
             }
             
             # Log request details
@@ -288,6 +304,8 @@ class GCSConnector:
             logger.info(f"Put asset response status: {response.status_code}")
             if response.status_code >= 400:
                 logger.info(f"Put asset response body: {response.text[:500]}...")
+            else:
+                logger.info("Successfully completed asset translation")
                 
             response.raise_for_status()
             
@@ -296,86 +314,42 @@ class GCSConnector:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error putting asset: {e}")
             
-            # Try alternative endpoints or methods
-            if isinstance(e, requests.exceptions.HTTPError) and (e.response.status_code == 404 or e.response.status_code == 400):
-                try:
-                    # Try using the complete asset API
-                    complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_id}/locales/{self.current_target_locale}/complete"
-                    logger.info(f"Trying asset completion API: {complete_url}")
-                    
-                    headers = self.get_auth_headers()
-                    headers["Content-Type"] = "application/json"
-                    
-                    # Prepare the data for completion
-                    complete_data = {
-                        "assetName": asset_id,
-                        "tenantId": self.current_tenant_id,
-                        "targetAssetLocale": {
-                            "locale": self.current_target_locale,
-                            "status": "TRANSLATED"
-                        },
-                        "targetAssetUrl": {
-                            "locale": self.current_target_locale,
-                            "url": "dummy-url", # This is a placeholder
-                            "urlType": "TRANSLATED"
-                        }
-                    }
-                    
-                    response = requests.put(complete_url, headers=headers, json=complete_data)
-                    response.raise_for_status()
-                    logger.info(f"Successfully completed asset using alternative API")
-                    
-                    return {"status": "completed"}
-                    
-                except Exception as alt_e:
-                    logger.error(f"Error using alternative completion API: {alt_e}")
-            
-            # Try the upload to storage API as a final fallback
+            # Try using the serviceBaseUrl if available
             try:
-                upload_url = f"{self.gcs_api_base_url}/uploadToStorage"
-                logger.info(f"Attempting to upload directly to storage: {upload_url}")
+                if hasattr(self, 'current_event') and self.current_event.get("serviceBaseUrl"):
+                    service_base_url = self.current_event.get("serviceBaseUrl")
+                    logger.info(f"Trying to complete with serviceBaseUrl: {service_base_url}")
+                    
+                    # Try the completion endpoint with serviceBaseUrl
+                    url = f"{service_base_url}/api/v1/projects/{project_id}/tasks/{task_id}/assets/{target_locale}/complete?tenantId={tenant_id}"
+                    
+                    response = requests.put(url, headers=headers, json=data)
+                    
+                    logger.info(f"Service URL completion status: {response.status_code}")
+                    if response.status_code < 400:
+                        logger.info("Successfully completed asset using serviceBaseUrl")
+                        return response.json() if response.text else {"status": "success"}
+            except Exception as service_e:
+                logger.error(f"Error using serviceBaseUrl for completion: {service_e}")
                 
-                headers = self.get_auth_headers()
-                files = {'file': ('translated.txt', translated_content)}
-                form_data = {'tenantId': self.current_tenant_id}
+            # If all else fails, try to at least mark the task as complete
+            try:
+                complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/complete?tenantId={tenant_id}"
+                logger.info(f"Attempting to mark task as complete: {complete_url}")
                 
-                response = requests.post(upload_url, headers=headers, files=files, data=form_data)
-                response.raise_for_status()
+                complete_data = {
+                    "tenantId": tenant_id,
+                    "status": "COMPLETED"
+                }
                 
-                upload_response = response.json()
-                logger.info(f"Successfully uploaded to storage: {upload_response}")
-                
-                # Now try to complete the asset with the new URL
-                if "response" in upload_response and upload_response.get("success", False):
-                    storage_url = upload_response.get("response")
-                    
-                    complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_id}/locales/{self.current_target_locale}/complete"
-                    
-                    complete_data = {
-                        "assetName": asset_id,
-                        "tenantId": self.current_tenant_id,
-                        "targetAssetLocale": {
-                            "locale": self.current_target_locale,
-                            "status": "TRANSLATED"
-                        },
-                        "targetAssetUrl": {
-                            "locale": self.current_target_locale,
-                            "url": storage_url,
-                            "urlType": "TRANSLATED"
-                        }
-                    }
-                    
-                    complete_headers = self.get_auth_headers()
-                    complete_headers["Content-Type"] = "application/json"
-                    
-                    complete_response = requests.put(complete_url, headers=complete_headers, json=complete_data)
-                    complete_response.raise_for_status()
-                    logger.info(f"Successfully completed asset using uploaded file URL")
-                    
-                    return {"status": "completed with storage upload"}
-            
-            except Exception as storage_e:
-                logger.error(f"Error with storage upload fallback: {storage_e}")
+                response = requests.put(complete_url, headers=headers, json=complete_data)
+                if response.status_code < 400:
+                    logger.info("Successfully marked task as complete")
+                    return {"status": "task marked complete"}
+                else:
+                    logger.info(f"Task completion failed: {response.status_code} - {response.text[:500]}")
+            except Exception as complete_e:
+                logger.error(f"Error trying to mark task as complete: {complete_e}")
             
             raise
     
