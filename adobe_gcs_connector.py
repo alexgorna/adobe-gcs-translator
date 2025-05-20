@@ -11,9 +11,11 @@ import xml.etree.ElementTree as ET
 # Custom JSON formatter for structured logging
 class JsonFormatter(logging.Formatter):
     def format(self, record):
+        # Use the actual log level from the record, not from the message
         log_record = {
             "level": record.levelname.lower(),
-            "msg": super(JsonFormatter, self).format(record),
+            # Don't include the level in the message part
+            "msg": record.getMessage(),  # Just the message without level prefix
             "logger": record.name,
             "timestamp": self.formatTime(record, self.datefmt)
         }
