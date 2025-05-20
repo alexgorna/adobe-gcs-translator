@@ -560,7 +560,7 @@ class GCSConnector:
             Provide ONLY the translated text with NO additional comments or explanations.
             
             IMPORTANT: 
-            - Preserve any markers like [ITEM-0][TRANS-UNIT] in your translation
+            - DO NOT preserve any markers like [ITEM-0][TRANS-UNIT] in your translation
             - Maintain the exact same format and structure
             - Translate all content, including titles and headings
             - Keep any HTML tags intact
