@@ -1,4 +1,4 @@
-# v1.0
+# v1.0 - railway logging attempt
 import os
 import time
 import json
@@ -9,16 +9,65 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("gcs_connector.log"),
-        logging.StreamHandler()
-    ]
-)
+# Custom JSON formatter for Railway's logging system
+class RailwayJsonFormatter(logging.Formatter):
+    """
+    Formatter that outputs JSON strings after logging events.
+    Adapted for Railway's logging system.
+    """
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.json_default = kwargs.pop("json_default", str)
+
+    def format(self, record):
+        log_record = {}
+        
+        # Add the message (required)
+        log_record["msg"] = super().format(record)
+        
+        # Add the level - Railway normalizes this
+        log_record["level"] = record.levelname.lower()
+        
+        # Add the timestamp
+        log_record["timestamp"] = datetime.fromtimestamp(record.created).isoformat()
+        
+        # Add useful attributes for filtering
+        log_record["service"] = "gcs-translator"
+        log_record["component"] = record.name
+        
+        # Add any exc_info if it exists
+        if record.exc_info:
+            log_record["error"] = self.formatException(record.exc_info)
+        
+        # Add any custom attributes from the record
+        for key, value in record.__dict__.items():
+            if key not in ('args', 'asctime', 'created', 'exc_info', 'exc_text', 'filename',
+                          'funcName', 'id', 'levelname', 'levelno', 'lineno',
+                          'module', 'msecs', 'message', 'msg', 'name', 'pathname',
+                          'process', 'processName', 'relativeCreated', 'stack_info',
+                          'thread', 'threadName'):
+                log_record[key] = value
+        
+        return json.dumps(log_record, default=self.json_default)
+
+# Setup improved logging
+# Create logger
 logger = logging.getLogger("GCSConnector")
+logger.setLevel(logging.INFO)
+
+# Remove any existing handlers
+for handler in logger.handlers:
+    logger.removeHandler(handler)
+
+# Create console handler with the custom formatter
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(RailwayJsonFormatter())
+logger.addHandler(console_handler)
+
+# File handler for local debugging (optional)
+file_handler = logging.FileHandler("gcs_connector.log")
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
 
 # Load environment variables
 load_dotenv()
@@ -49,10 +98,12 @@ class GCSConnector:
         # Event processing state
         self.next_url = None
         self.poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+        
+        logger.info("GCS Connector initialized", extra={"action": "init"})
     
     def refresh_access_token(self):
         """Refreshes the Adobe access token using the OAuth client credentials flow."""
-        logger.info("Refreshing Adobe access token")
+        logger.info("Refreshing Adobe access token", extra={"action": "refresh_token"})
         
         url = "https://ims-na1.adobelogin.com/ims/token/v3"
         headers = {
@@ -76,10 +127,12 @@ class GCSConnector:
             # Set expiry time 5 minutes before actual expiry to be safe
             self.token_expiry_time = time.time() + expires_in - 300
             
-            logger.info("Successfully refreshed access token")
+            logger.info("Successfully refreshed access token", 
+                       extra={"action": "refresh_token_success", "expires_in": expires_in})
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to refresh access token: {e}")
+            logger.error(f"Failed to refresh access token: {str(e)}", 
+                        extra={"action": "refresh_token_error", "error_details": str(e)})
             raise
     
     def get_auth_headers(self):
@@ -105,14 +158,21 @@ class GCSConnector:
         if "</events-fast/" in url:
             # Extract the actual path after </events-fast/
             path = url.split("</events-fast/")[1]
-            return f"https://events-va6.adobe.io/events-fast/{path}"
+            url_fixed = f"https://events-va6.adobe.io/events-fast/{path}"
+            logger.debug(f"Fixed URL from {url} to {url_fixed}", 
+                        extra={"action": "fix_url", "original": url, "fixed": url_fixed})
+            return url_fixed
             
         # Fix URLs that are missing the protocol and domain
         if not url.startswith("http"):
             if url.startswith("/"):
-                return f"https://events-va6.adobe.io{url}"
+                url_fixed = f"https://events-va6.adobe.io{url}"
             else:
-                return f"https://events-va6.adobe.io/{url}"
+                url_fixed = f"https://events-va6.adobe.io/{url}"
+                
+            logger.debug(f"Fixed URL from {url} to {url_fixed}", 
+                        extra={"action": "fix_url", "original": url, "fixed": url_fixed})
+            return url_fixed
                 
         return url
     
@@ -124,13 +184,14 @@ class GCSConnector:
             else:
                 url = self.fix_url(self.next_url)
                 
-            logger.info(f"Polling for events: {url}")
+            logger.info(f"Polling for events", extra={"action": "poll_events", "url": url})
             
             headers = self.get_auth_headers()
             response = requests.get(url, headers=headers)
             
             if response.status_code == 204:
-                logger.info("No new events (204 No Content)")
+                logger.info("No new events (204 No Content)", 
+                           extra={"action": "poll_events_result", "status": 204})
                 return
                 
             response.raise_for_status()
@@ -143,27 +204,38 @@ class GCSConnector:
                         # Extract URL from link header
                         next_url = link.split(";")[0].strip("<>")
                         self.next_url = next_url
+                        logger.debug(f"Found next URL: {next_url}", 
+                                    extra={"action": "next_url_found", "next_url": next_url})
                         break
             
             # Process events
             response_data = response.json()
             events = response_data.get("events", [])
             
+            logger.info(f"Received {len(events)} events", 
+                       extra={"action": "events_received", "count": len(events)})
+            
             for event_wrapper in events:
                 event = event_wrapper.get("event", {}).get("body", {})
                 event_code = event.get("eventCode")
+                
+                logger.info(f"Processing event: {event_code}", 
+                           extra={"action": "process_event", "event_code": event_code})
                 
                 if event_code == "TRANSLATE":
                     self.handle_translate_event(event)
                 elif event_code == "RE_TRANSLATE":
                     self.handle_retranslate_event(event)
                 else:
-                    logger.warning(f"Unknown event code: {event_code}")
+                    logger.warning(f"Unknown event code: {event_code}", 
+                                  extra={"action": "unknown_event", "event_code": event_code})
             
-            logger.info(f"Processed {len(events)} events")
+            logger.info(f"Processed {len(events)} events", 
+                       extra={"action": "events_processed", "count": len(events)})
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error polling for events: {e}")
+            logger.error(f"Error polling for events: {str(e)}", 
+                        extra={"action": "poll_events_error", "error_details": str(e), "url": url})
     
     def get_assets(self, project_id, task_id, target_locale, tenant_id):
         """
@@ -174,27 +246,32 @@ class GCSConnector:
         """
         try:
             url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{target_locale}?tenantId={tenant_id}"
-            logger.info(f"Getting assets from: {url}")
+            logger.info(f"Getting assets", 
+                       extra={"action": "get_assets", "project_id": project_id, "task_id": task_id, "url": url})
             
             headers = self.get_auth_headers()
             response = requests.get(url, headers=headers)
             
             # Log the response for debugging
-            logger.info(f"Get assets response status: {response.status_code}")
+            logger.info(f"Get assets response", 
+                       extra={"action": "get_assets_response", "status": response.status_code})
             
             if response.status_code != 200:
-                logger.info(f"Get assets response body: {response.text[:500]}...")
+                logger.info(f"Get assets response body", 
+                           extra={"action": "get_assets_response_body", "body": response.text[:500]})
                 response.raise_for_status()
             
             # Parse the response
             assets_data = response.json()
-            logger.info(f"Successfully retrieved assets information")
+            logger.info(f"Successfully retrieved assets information", 
+                       extra={"action": "get_assets_success"})
             
             # Return the response which contains the assets information
             return assets_data.get("response", [])
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting assets: {e}")
+            logger.error(f"Error getting assets: {str(e)}", 
+                        extra={"action": "get_assets_error", "error_details": str(e), "url": url})
             raise
     
     def get_asset_content(self, tenant_id, object_key):
@@ -206,23 +283,29 @@ class GCSConnector:
         """
         try:
             url = f"{self.gcs_api_base_url}/assetContent?tenantId={tenant_id}&objectKey={object_key}"
-            logger.info(f"Getting asset content from: {url}")
+            logger.info(f"Getting asset content", 
+                       extra={"action": "get_asset_content", "object_key": object_key})
             
             headers = self.get_auth_headers()
             response = requests.get(url, headers=headers)
             
             # Log the response for debugging
-            logger.info(f"Get asset content response status: {response.status_code}")
+            logger.info(f"Get asset content response", 
+                       extra={"action": "get_asset_content_response", "status": response.status_code})
             
             if response.status_code != 200:
-                logger.info(f"Get asset content response body: {response.text[:500]}...")
+                logger.info(f"Get asset content response body", 
+                           extra={"action": "get_asset_content_response_body", "body": response.text[:500]})
                 response.raise_for_status()
             
             # Return the content which should be the XLIFF file
+            logger.info(f"Retrieved asset content", 
+                       extra={"action": "get_asset_content_success", "content_length": len(response.text)})
             return response.text
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error getting asset content: {e}")
+            logger.error(f"Error getting asset content: {str(e)}", 
+                        extra={"action": "get_asset_content_error", "error_details": str(e), "url": url})
             raise
     
     def upload_translated_content(self, tenant_id, translated_content, file_name="translated.xlf"):
@@ -234,7 +317,8 @@ class GCSConnector:
         """
         try:
             url = f"{self.gcs_api_base_url}/uploadToStorage"
-            logger.info(f"Uploading translated content to: {url}")
+            logger.info(f"Uploading translated content", 
+                       extra={"action": "upload_content", "file_name": file_name})
             
             headers = self.get_auth_headers()
             # Don't include Content-Type as requests will set it with the proper boundary
@@ -253,21 +337,25 @@ class GCSConnector:
             response = requests.post(url, headers=headers, files=files, data=data)
             
             # Log the response for debugging
-            logger.info(f"Upload translated content response status: {response.status_code}")
+            logger.info(f"Upload translated content response", 
+                       extra={"action": "upload_content_response", "status": response.status_code})
             
             if response.status_code != 200:
-                logger.info(f"Upload translated content response body: {response.text[:500]}...")
+                logger.info(f"Upload translated content response body", 
+                           extra={"action": "upload_content_response_body", "body": response.text[:500]})
                 response.raise_for_status()
             
             # Parse the response to get the URL of the uploaded file
             upload_data = response.json()
-            logger.info("Successfully uploaded translated content")
+            logger.info("Successfully uploaded translated content", 
+                       extra={"action": "upload_content_success"})
             
             # Return the URL where the translated content was uploaded
             return upload_data.get("response")
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error uploading translated content: {e}")
+            logger.error(f"Error uploading translated content: {str(e)}", 
+                        extra={"action": "upload_content_error", "error_details": str(e), "url": url})
             raise
     
     def complete_asset_translation(self, project_id, task_id, asset_name, target_locale, tenant_id, translated_url):
@@ -291,20 +379,25 @@ class GCSConnector:
                 "status": "IN_TRANSLATION"
             }
             
-            logger.info(f"Updating asset state to IN_TRANSLATION: {update_url}")
+            logger.info(f"Updating asset state to IN_TRANSLATION", 
+                       extra={"action": "update_asset_state", "url": update_url})
             update_response = requests.put(update_url, headers=update_headers, json=update_payload)
             
             # Log the update response for debugging
-            logger.info(f"Update asset state response status: {update_response.status_code}")
+            logger.info(f"Update asset state response", 
+                       extra={"action": "update_asset_state_response", "status": update_response.status_code})
             if update_response.status_code not in (200, 201, 204):
-                logger.error(f"Error updating asset state: {update_response.status_code} - {update_response.text}")
+                logger.error(f"Error updating asset state", 
+                            extra={"action": "update_asset_state_error", "status": update_response.status_code, "body": update_response.text[:500]})
                 update_response.raise_for_status()
             else:
-                logger.info("Successfully updated asset state to IN_TRANSLATION")
+                logger.info("Successfully updated asset state to IN_TRANSLATION", 
+                           extra={"action": "update_asset_state_success"})
             
             # Now proceed with the completion
             complete_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}/complete"
-            logger.info(f"Completing asset translation: {complete_url}")
+            logger.info(f"Completing asset translation", 
+                       extra={"action": "complete_asset", "url": complete_url})
             
             complete_headers = self.get_auth_headers()
             complete_headers["Content-Type"] = "application/json"
@@ -329,20 +422,24 @@ class GCSConnector:
             complete_response = requests.put(complete_url, headers=complete_headers, json=complete_payload)
             
             # Log the response for debugging
-            logger.info(f"Complete asset translation response status: {complete_response.status_code}")
+            logger.info(f"Complete asset translation response", 
+                       extra={"action": "complete_asset_response", "status": complete_response.status_code})
             
             if complete_response.status_code not in (200, 201):
-                logger.info(f"Complete asset translation response body: {complete_response.text[:500]}...")
+                logger.info(f"Complete asset translation response body", 
+                           extra={"action": "complete_asset_response_body", "body": complete_response.text[:500]})
                 complete_response.raise_for_status()
             
             # Parse the response
             completion_data = complete_response.json() if complete_response.text else {"status": "completed"}
-            logger.info("Successfully completed asset translation")
+            logger.info("Successfully completed asset translation", 
+                       extra={"action": "complete_asset_success"})
             
             return completion_data
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error completing asset translation: {e}")
+            logger.error(f"Error completing asset translation: {str(e)}", 
+                        extra={"action": "complete_asset_error", "error_details": str(e)})
             raise
      
     def translate_xliff_with_anthropic(self, xliff_content, source_language, target_language):
@@ -395,7 +492,8 @@ class GCSConnector:
                 if elem not in all_elements:
                     all_elements.append(elem)
             
-            logger.info(f"Found {len(all_elements)} potentially translatable elements in XLIFF file")
+            logger.info(f"Found translatable elements in XLIFF file", 
+                       extra={"action": "xliff_analysis", "element_count": len(all_elements)})
             
             # Extract text to translate
             translation_items = []
@@ -432,7 +530,8 @@ class GCSConnector:
                 if source_text:
                     translation_items.append((i, element_type, element, source, target, source_text))
             
-            logger.info(f"Extracted {len(translation_items)} items for translation")
+            logger.info(f"Extracted items for translation", 
+                       extra={"action": "xliff_extraction", "item_count": len(translation_items)})
             
             # If we found translation items, process them
             if translation_items:
@@ -526,19 +625,30 @@ class GCSConnector:
                 # Basic fallback
                 translated_xliff = ET.tostring(root, encoding='utf-8', method='xml').decode('utf-8')
             
+            logger.info(f"XLIFF translation completed", 
+                       extra={"action": "xliff_translation_complete", "result_length": len(translated_xliff)})
+            
             # Return the translated XLIFF
             return translated_xliff
             
         except Exception as e:
             import traceback
-            logger.error(f"Error translating XLIFF with Anthropic: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Error translating XLIFF with Anthropic", 
+                        extra={"action": "xliff_translation_error", 
+                               "error_details": str(e),
+                               "traceback": traceback.format_exc()})
             # If there's an error, return the original content
             return xliff_content
     
     def translate_with_anthropic(self, source_text, source_language, target_language):
         """Uses Anthropic's Claude to translate text using direct API calls."""
         try:
+            logger.info(f"Translating text with Anthropic", 
+                       extra={"action": "translate", 
+                              "source_language": source_language, 
+                              "target_language": target_language,
+                              "text_length": len(source_text)})
+            
             headers = {
                 "x-api-key": self.anthropic_api_key,
                 "content-type": "application/json",
@@ -574,10 +684,16 @@ class GCSConnector:
             response.raise_for_status()
             
             response_data = response.json()
-            return response_data["content"][0]["text"]
+            result = response_data["content"][0]["text"]
+            
+            logger.info(f"Translation complete", 
+                       extra={"action": "translate_success", "result_length": len(result)})
+            
+            return result
             
         except Exception as e:
-            logger.error(f"Error translating with Anthropic: {e}")
+            logger.error(f"Error translating with Anthropic", 
+                        extra={"action": "translate_error", "error_details": str(e)})
             raise
     
     def extract_object_key_from_url(self, url):
@@ -599,10 +715,13 @@ class GCSConnector:
             if "?" in object_key:
                 object_key = object_key.split("?")[0]
             
+            logger.debug(f"Extracted object key from URL", 
+                        extra={"action": "extract_object_key", "url": url, "object_key": object_key})
             return object_key
         
         # If the URL doesn't match the expected format, return the full URL as fallback
-        logger.warning(f"Could not extract object key from URL: {url}")
+        logger.warning(f"Could not extract object key from URL", 
+                      extra={"action": "extract_object_key_failed", "url": url})
         return url
     
     def handle_translate_event(self, event):
@@ -623,20 +742,30 @@ class GCSConnector:
             target_locale = event.get("targetLocale")
             tenant_id = event.get("tenantId")
             
-            logger.info(f"Processing TRANSLATE event - Project: {project_id}, Task: {task_id}")
-            logger.info(f"Translating from {source_locale} to {target_locale}")
+            logger.info(f"Processing TRANSLATE event", 
+                       extra={"action": "translate_event", 
+                              "project_id": project_id, 
+                              "task_id": task_id,
+                              "source_locale": source_locale,
+                              "target_locale": target_locale})
+            
+            # Log the full event data for debugging
+            logger.info(f"Event data", extra={"action": "event_data", "event": json.dumps(event)})
             
             # Step 1: Get assets information
             assets = self.get_assets(project_id, task_id, target_locale, tenant_id)
-            logger.info(f"Retrieved {len(assets)} assets for translation")
+            logger.info(f"Retrieved assets for translation", 
+                       extra={"action": "assets_retrieved", "count": len(assets)})
             
             if not assets:
-                logger.warning("No assets found for translation")
+                logger.warning("No assets found for translation", 
+                              extra={"action": "no_assets", "task_id": task_id})
                 return
             
             for asset in assets:
                 asset_name = asset.get("name")
-                logger.info(f"Processing asset: {asset_name}")
+                logger.info(f"Processing asset", 
+                           extra={"action": "process_asset", "asset_name": asset_name})
                 
                 # Find the NORMALIZED URL from assetUrls
                 normalized_url = None
@@ -648,35 +777,47 @@ class GCSConnector:
                         break
                 
                 if not normalized_url:
-                    logger.warning(f"No NORMALIZED URL found for asset {asset_name}")
+                    logger.warning(f"No NORMALIZED URL found for asset", 
+                                  extra={"action": "no_normalized_url", "asset_name": asset_name})
                     continue
                 
                 # Extract the object key from the normalized URL
                 object_key = self.extract_object_key_from_url(normalized_url)
-                logger.info(f"Extracted object key: {object_key}")
+                logger.info(f"Extracted object key", 
+                           extra={"action": "object_key", "object_key": object_key})
                 
                 # Step 2: Download the XLIFF content
                 xliff_content = self.get_asset_content(tenant_id, object_key)
-                logger.info(f"Retrieved XLIFF content of length: {len(xliff_content)}")
+                logger.info(f"Retrieved XLIFF content", 
+                           extra={"action": "xliff_retrieved", "content_length": len(xliff_content)})
                 
                 # Step 3: Translate the XLIFF content
                 translated_xliff = self.translate_xliff_with_anthropic(xliff_content, source_locale, target_locale)
-                logger.info(f"Translated XLIFF content of length: {len(translated_xliff)}")
+                logger.info(f"Translated XLIFF content", 
+                           extra={"action": "xliff_translated", "content_length": len(translated_xliff)})
                 
                 # Step 4: Upload the translated XLIFF
                 file_name = f"{asset_name}_{target_locale}.xlf"
                 translated_url = self.upload_translated_content(tenant_id, translated_xliff, file_name)
-                logger.info(f"Uploaded translated content to: {translated_url}")
+                logger.info(f"Uploaded translated content", 
+                           extra={"action": "content_uploaded", "url": translated_url})
                 
                 # Step 5: Complete the asset translation
                 completion_result = self.complete_asset_translation(
                     project_id, task_id, asset_name, target_locale, tenant_id, translated_url
                 )
-                logger.info(f"Completed asset translation: {completion_result}")
+                logger.info(f"Completed asset translation", 
+                           extra={"action": "asset_completed", "result": json.dumps(completion_result)})
             
             
         except Exception as e:
-            logger.error(f"Error handling TRANSLATE event: {e}")
+            import traceback
+            logger.error(f"Error handling TRANSLATE event", 
+                        extra={"action": "translate_event_error", 
+                               "error_details": str(e),
+                               "traceback": traceback.format_exc(),
+                               "project_id": project_id,
+                               "task_id": task_id})
     
     def handle_retranslate_event(self, event):
         """
@@ -693,43 +834,62 @@ class GCSConnector:
             asset_name = event.get("assetName")
             asset_url = event.get("assetUrl")
             
-            logger.info(f"Processing RE_TRANSLATE event - Project: {project_id}, Task: {task_id}")
-            logger.info(f"Re-translating asset {asset_name} from {source_locale} to {target_locale}")
+            logger.info(f"Processing RE_TRANSLATE event", 
+                       extra={"action": "retranslate_event", 
+                              "project_id": project_id, 
+                              "task_id": task_id,
+                              "asset_name": asset_name})
+            
+            # Log the full event data for debugging
+            logger.info(f"Event data", extra={"action": "event_data", "event": json.dumps(event)})
             
             # For RE_TRANSLATE, we already have the asset URL in the event
             if not asset_url:
-                logger.warning("No asset URL found in RE_TRANSLATE event")
+                logger.warning("No asset URL found in RE_TRANSLATE event", 
+                              extra={"action": "no_asset_url", "task_id": task_id})
                 return
             
             # Download the XLIFF content
             # The asset_url is a direct download link, so we don't need to use the assetContent API
+            logger.info(f"Downloading XLIFF content from URL", 
+                       extra={"action": "download_xliff", "url": asset_url})
             response = requests.get(asset_url, headers=self.get_auth_headers())
             response.raise_for_status()
             xliff_content = response.text
             
-            logger.info(f"Retrieved XLIFF content of length: {len(xliff_content)}")
+            logger.info(f"Retrieved XLIFF content", 
+                       extra={"action": "xliff_retrieved", "content_length": len(xliff_content)})
             
             # Translate the XLIFF content
             translated_xliff = self.translate_xliff_with_anthropic(xliff_content, source_locale, target_locale)
-            logger.info(f"Translated XLIFF content of length: {len(translated_xliff)}")
+            logger.info(f"Translated XLIFF content", 
+                       extra={"action": "xliff_translated", "content_length": len(translated_xliff)})
             
             # Upload the translated XLIFF
             file_name = f"{asset_name}_{target_locale}.xlf"
             translated_url = self.upload_translated_content(tenant_id, translated_xliff, file_name)
-            logger.info(f"Uploaded translated content to: {translated_url}")
+            logger.info(f"Uploaded translated content", 
+                       extra={"action": "content_uploaded", "url": translated_url})
             
             # Complete the asset translation
             completion_result = self.complete_asset_translation(
                 project_id, task_id, asset_name, target_locale, tenant_id, translated_url
             )
-            logger.info(f"Completed asset translation: {completion_result}")
+            logger.info(f"Completed asset translation", 
+                       extra={"action": "asset_completed", "result": json.dumps(completion_result)})
             
         except Exception as e:
-            logger.error(f"Error handling RE_TRANSLATE event: {e}")
+            import traceback
+            logger.error(f"Error handling RE_TRANSLATE event", 
+                        extra={"action": "retranslate_event_error", 
+                               "error_details": str(e),
+                               "traceback": traceback.format_exc(),
+                               "project_id": project_id if 'project_id' in locals() else 'unknown',
+                               "task_id": task_id if 'task_id' in locals() else 'unknown'})
     
     def run(self):
         """Main execution loop of the connector."""
-        logger.info("Starting GCS Connector")
+        logger.info("Starting GCS Connector", extra={"action": "startup"})
         
         # Initial token refresh
         self.refresh_access_token()
@@ -739,11 +899,15 @@ class GCSConnector:
                 self.poll_for_events()
                 
                 # Sleep before polling again
-                logger.info(f"Sleeping for {self.poll_interval} seconds")
+                logger.info(f"Sleeping", extra={"action": "sleeping", "seconds": self.poll_interval})
                 time.sleep(self.poll_interval)
                 
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                import traceback
+                logger.error(f"Error in main loop", 
+                            extra={"action": "main_loop_error", 
+                                   "error_details": str(e),
+                                   "traceback": traceback.format_exc()})
                 
                 # Sleep a bit longer before retrying after an error
                 time.sleep(self.poll_interval * 2)
