@@ -1,3 +1,4 @@
+# adobe_gcs_connector.py
 import os
 import time
 import json
@@ -8,31 +9,16 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 
-# Custom JSON formatter for structured logging
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        # Use the actual log level from the record, not from the message
-        log_record = {
-            "level": record.levelname.lower(),
-            # Don't include the level in the message part
-            "msg": record.getMessage(),  # Just the message without level prefix
-            "logger": record.name,
-            "timestamp": self.formatTime(record, self.datefmt)
-        }
-        return json.dumps(log_record)
-
-# Setup logging with JSON formatter
-logging.basicConfig(level=logging.INFO)
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("gcs_connector.log"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger("GCSConnector")
-
-# Remove existing handlers
-for handler in logger.handlers[:]:
-    logger.removeHandler(handler)
-
-# Add new handler with JSON formatter
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logger.addHandler(handler)
 
 # Load environment variables
 load_dotenv()
@@ -332,15 +318,7 @@ class GCSConnector:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error completing asset translation: {e}")
             raise
-    
-    def complete_task(self, project_id, task_id, tenant_id):
-        """
-        Task completion is handled automatically by Adobe after completing all assets.
-        This method is kept for compatibility but doesn't make an API call.
-        """
-        logger.info(f"Task completion is handled automatically by Adobe - no API call needed")
-        return True
-    
+     
     def translate_xliff_with_anthropic(self, xliff_content, source_language, target_language):
         """
         Enhanced XLIFF translation that captures all translatable elements including
@@ -609,6 +587,7 @@ class GCSConnector:
         3. Translate the XLIFF content
         4. Upload the translated XLIFF
         5. Complete the asset translation
+        6. Mark the task as complete
         """
         try:
             # Extract information from the event
@@ -669,8 +648,6 @@ class GCSConnector:
                 )
                 logger.info(f"Completed asset translation: {completion_result}")
             
-            # Task is automatically completed by Adobe after all assets are completed
-            self.complete_task(project_id, task_id, tenant_id)
             
         except Exception as e:
             logger.error(f"Error handling TRANSLATE event: {e}")
@@ -720,9 +697,6 @@ class GCSConnector:
                 project_id, task_id, asset_name, target_locale, tenant_id, translated_url
             )
             logger.info(f"Completed asset translation: {completion_result}")
-            
-            # Task is automatically completed by Adobe after all assets are completed
-            self.complete_task(project_id, task_id, tenant_id)
             
         except Exception as e:
             logger.error(f"Error handling RE_TRANSLATE event: {e}")
