@@ -288,6 +288,7 @@ class GCSConnector:
             payload = {
                 "assetName": asset_name,
                 "tenantId": tenant_id,
+                "orgId": self.ims_org_id,
                 "targetAssetLocale": {
                     "locale": target_locale,
                     "status": "TRANSLATED"
