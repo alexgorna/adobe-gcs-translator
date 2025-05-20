@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import requests
+import re
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
@@ -318,76 +319,169 @@ class GCSConnector:
             logger.error(f"Error completing asset translation: {e}")
             raise
     
+    def complete_task(self, project_id, task_id, tenant_id):
+        """
+        Marks the entire translation task as complete.
+        
+        As per documentation:
+        PUT /v1/projects/{project}/tasks/{task}/complete?tenantId={tenantId}
+        """
+        try:
+            url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/complete?tenantId={tenant_id}"
+            logger.info(f"Marking task as complete: {url}")
+            
+            headers = self.get_auth_headers()
+            headers["Content-Type"] = "application/json"
+            
+            # Prepare the request payload
+            payload = {
+                "tenantId": tenant_id,
+                "status": "COMPLETED"
+            }
+            
+            # Make the request
+            response = requests.put(url, headers=headers, json=payload)
+            
+            # Log the response for debugging
+            logger.info(f"Complete task response status: {response.status_code}")
+            
+            if response.status_code not in (200, 201, 204):
+                logger.info(f"Complete task response body: {response.text[:500]}...")
+                response.raise_for_status()
+            
+            logger.info("Successfully marked task as complete")
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error completing task: {e}")
+            return False
+    
     def translate_xliff_with_anthropic(self, xliff_content, source_language, target_language):
         """
-        Translates XLIFF content using Anthropic's Claude.
-        
-        This function preserves the XML structure and only translates the content in <source> tags.
+        Enhanced XLIFF translation that captures all translatable elements including
+        headers, titles, and other special elements that might be missed by simpler methods.
         """
         try:
             # Parse the XLIFF file
             root = ET.fromstring(xliff_content)
             
-            # Namespace handling can be complex in XML, so let's handle it properly
-            namespaces = {'xliff': 'urn:oasis:names:tc:xliff:document:1.2'}
+            # Store all namespaces for proper handling
+            namespaces = {}
+            for prefix, uri in root.nsmap.items() if hasattr(root, 'nsmap') else []:
+                namespaces[prefix] = uri
             
-            # Find all <trans-unit> elements
-            trans_units = root.findall('.//xliff:trans-unit', namespaces)
-            if not trans_units:
-                # Try without namespace if not found
-                trans_units = root.findall('.//trans-unit')
+            # List to store all found translatable elements
+            translatable_elements = []
             
-            # If still no trans-units found, try another approach
-            if not trans_units:
-                # This is a fallback for simpler XLIFF files
-                for element in root.findall('.//*'):
-                    if element.tag.endswith('trans-unit'):
-                        trans_units.append(element)
+            # Find all possible translatable elements using various search methods
             
-            logger.info(f"Found {len(trans_units)} translation units in XLIFF file")
+            # 1. Standard trans-units (most common case)
+            trans_units = []
+            for element in root.findall('.//*'):
+                if element.tag.endswith('trans-unit'):
+                    trans_units.append(element)
+            
+            # 2. Look for header elements (often missed)
+            header_elements = []
+            for element in root.findall('.//*'):
+                tag = element.tag.lower()
+                if any(x in tag for x in ['title', 'header', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                    header_elements.append(element)
+            
+            # 3. Check for elements with translatable attribute
+            translatable_attr_elements = []
+            for element in root.findall('.//*[@translatable="yes"]'):
+                translatable_attr_elements.append(element)
+            
+            # 4. Check resname attribute for clues about content type
+            resname_elements = []
+            for element in root.findall('.//*[@resname]'):
+                resname = element.get('resname', '').lower()
+                if any(x in resname for x in ['title', 'header', 'heading']):
+                    resname_elements.append(element)
+            
+            # Combine all found elements but eliminate duplicates
+            all_elements = []
+            for elem in trans_units + header_elements + translatable_attr_elements + resname_elements:
+                if elem not in all_elements:
+                    all_elements.append(elem)
+            
+            logger.info(f"Found {len(all_elements)} potentially translatable elements in XLIFF file")
             
             # Extract text to translate
             translation_items = []
-            for i, unit in enumerate(trans_units):
-                # Find the source element
-                source = unit.find('./xliff:source', namespaces)
-                if not source:
-                    # Try without namespace
-                    source = unit.find('./source')
+            
+            for i, element in enumerate(all_elements):
+                # For each element, find source and possibly target elements
+                source = None
+                target = None
+                element_type = "unknown"
                 
-                if source is not None and source.text:
-                    translation_items.append((i, source.text))
+                # Check if this is a trans-unit
+                if element.tag.endswith('trans-unit'):
+                    element_type = "trans-unit"
+                    # Find the source element
+                    for child in element:
+                        if child.tag.endswith('source'):
+                            source = child
+                        elif child.tag.endswith('target'):
+                            target = child
+                
+                # If it's another type of element, the element itself might be translatable
+                else:
+                    element_type = "direct"
+                    source = element
+                
+                # Extract text from source if found
+                source_text = ""
+                if source is not None:
+                    # Get text content, including text from child elements
+                    source_text = ''.join(source.itertext()) if hasattr(source, 'itertext') else (source.text or "")
+                    source_text = source_text.strip()
+                
+                # Only add non-empty items for translation
+                if source_text:
+                    translation_items.append((i, element_type, element, source, target, source_text))
+            
+            logger.info(f"Extracted {len(translation_items)} items for translation")
             
             # If we found translation items, process them
             if translation_items:
-                # Combine all texts for a single translation request to save API calls
-                combined_text = "\n---\n".join([f"Item {i}: {text}" for i, text in translation_items])
+                # Combine all texts for a single translation request with clear markers
+                combined_text = "\n---ITEM---\n".join([
+                    f"[ITEM-{i}][{element_type.upper()}] {text}" 
+                    for i, element_type, _, _, _, text in translation_items
+                ])
                 
                 # Translate using Anthropic
                 translated_combined = self.translate_with_anthropic(combined_text, source_language, target_language)
                 
                 # Split the translated text back into individual items
                 # First find the separator pattern
-                split_pattern = "\n---\n"
+                split_pattern = "\n---ITEM---\n"
                 if split_pattern not in translated_combined:
                     # Try alternate patterns if the expected one isn't found
-                    possible_patterns = ["\n---\n", "\n- - -\n", "\n--\n", "\n\n", "\n"]
+                    possible_patterns = [
+                        "\n---ITEM---\n", "\n- - -ITEM- - -\n", "\n--ITEM--\n", 
+                        "\n---\n", "\n- - -\n", "\n--\n", "\n\n", "\n"
+                    ]
                     for pattern in possible_patterns:
                         if pattern in translated_combined:
                             split_pattern = pattern
                             break
                 
+                # Split by the identified pattern
                 translated_parts = translated_combined.split(split_pattern)
                 
-                # Clean up the parts and remove any "Item X:" prefixes
+                # Clean up the parts and remove any markers
                 cleaned_parts = []
                 for part in translated_parts:
-                    # Remove "Item X:" prefix if present
-                    if part.strip().startswith("Item ") and ":" in part:
-                        part = part.split(":", 1)[1].strip()
+                    part = part.strip()
+                    # Remove item markers like [ITEM-0][TRANS-UNIT]
+                    part = re.sub(r'\[ITEM-\d+\]\[\w+\]\s*', '', part)
                     cleaned_parts.append(part)
                 
-                # If we don't have enough parts, repeat the last one
+                # If we don't have enough parts, repeat the last one or add placeholders
                 while len(cleaned_parts) < len(translation_items):
                     cleaned_parts.append(cleaned_parts[-1] if cleaned_parts else "")
                 
@@ -396,36 +490,60 @@ class GCSConnector:
                     cleaned_parts = cleaned_parts[:len(translation_items)]
                 
                 # Update the XLIFF with translations
-                for idx, (i, _) in enumerate(translation_items):
+                for idx, (i, element_type, element, source, target, _) in enumerate(translation_items):
                     if idx < len(cleaned_parts):
-                        unit = trans_units[i]
+                        translated_text = cleaned_parts[idx].strip()
                         
-                        # Find or create the target element
-                        target = unit.find('./xliff:target', namespaces)
-                        if target is None:
-                            target = unit.find('./target')
+                        # Skip if the translation is empty
+                        if not translated_text:
+                            continue
                         
-                        if target is None:
-                            # Create a new target element if it doesn't exist
-                            target = ET.SubElement(unit, 'target')
-                            
-                            # Copy xml:lang attribute from source if it exists
-                            source = unit.find('./xliff:source', namespaces) or unit.find('./source')
-                            if source is not None and '{http://www.w3.org/XML/1998/namespace}lang' in source.attrib:
-                                source_lang = source.attrib['{http://www.w3.org/XML/1998/namespace}lang']
-                                target.attrib['{http://www.w3.org/XML/1998/namespace}lang'] = target_language
+                        # Different handling based on element type
+                        if element_type == "trans-unit":
+                            # If we have a target element, update it
+                            if target is not None:
+                                target.text = translated_text
+                            else:
+                                # Create a new target element
+                                namespace = source.tag.rsplit('}', 1)[0] + '}' if '}' in source.tag else ""
+                                target_tag = namespace + 'target' if namespace else 'target'
+                                
+                                # Create new element with correct namespace
+                                new_target = ET.Element(target_tag)
+                                new_target.text = translated_text
+                                
+                                # Copy xml:lang attribute from source if it exists
+                                if '{http://www.w3.org/XML/1998/namespace}lang' in source.attrib:
+                                    new_target.attrib['{http://www.w3.org/XML/1998/namespace}lang'] = target_language
+                                
+                                # Add the new target element to the trans-unit
+                                element.append(new_target)
                         
-                        # Set the translated text
-                        target.text = cleaned_parts[idx]
+                        # For direct elements, update the element's text directly
+                        elif element_type == "direct":
+                            element.text = translated_text
             
             # Convert the modified XML back to a string
-            translated_xliff = ET.tostring(root, encoding='utf-8', method='xml').decode('utf-8')
+            # Use the native tostring method with careful encoding
+            if hasattr(ET, 'ElementTree'):
+                tree = ET.ElementTree(root)
+                # Use encoding='unicode' for Python 3.2+
+                try:
+                    translated_xliff = ET.tostring(root, encoding='unicode', method='xml')
+                except TypeError:
+                    # Fallback for older versions
+                    translated_xliff = ET.tostring(root, encoding='utf-8', method='xml').decode('utf-8')
+            else:
+                # Basic fallback
+                translated_xliff = ET.tostring(root, encoding='utf-8', method='xml').decode('utf-8')
             
             # Return the translated XLIFF
             return translated_xliff
             
         except Exception as e:
+            import traceback
             logger.error(f"Error translating XLIFF with Anthropic: {e}")
+            logger.error(traceback.format_exc())
             # If there's an error, return the original content
             return xliff_content
     
@@ -439,7 +557,14 @@ class GCSConnector:
             }
             
             prompt = f"""Please translate the following text from {source_language} to {target_language}. 
-            Provide only the translated text with no additional comments or explanations.
+            Provide ONLY the translated text with NO additional comments or explanations.
+            
+            IMPORTANT: 
+            - Preserve any markers like [ITEM-0][TRANS-UNIT] in your translation
+            - Maintain the exact same format and structure
+            - Translate all content, including titles and headings
+            - Keep any HTML tags intact
+            - Do not add any extra text or explanations
             
             Text to translate:
             {source_text}"""
@@ -499,6 +624,7 @@ class GCSConnector:
         3. Translate the XLIFF content
         4. Upload the translated XLIFF
         5. Complete the asset translation
+        6. Mark the task as complete
         """
         try:
             # Extract information from the event
@@ -558,14 +684,17 @@ class GCSConnector:
                     project_id, task_id, asset_name, target_locale, tenant_id, translated_url
                 )
                 logger.info(f"Completed asset translation: {completion_result}")
-                
+            
+            # Step 6: Mark the entire task as complete
+            self.complete_task(project_id, task_id, tenant_id)
+            
         except Exception as e:
             logger.error(f"Error handling TRANSLATE event: {e}")
     
     def handle_retranslate_event(self, event):
         """
         Handles a RE_TRANSLATE event following the same workflow as TRANSLATE
-        but using the specific asset URL from the event.
+        but using the specific asset URL from the event, and completing the task.
         """
         try:
             # Extract information from the event
@@ -607,6 +736,9 @@ class GCSConnector:
                 project_id, task_id, asset_name, target_locale, tenant_id, translated_url
             )
             logger.info(f"Completed asset translation: {completion_result}")
+            
+            # Mark the task as complete
+            self.complete_task(project_id, task_id, tenant_id)
             
         except Exception as e:
             logger.error(f"Error handling RE_TRANSLATE event: {e}")
