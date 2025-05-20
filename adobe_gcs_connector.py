@@ -1,4 +1,4 @@
-# v1.0 - railway logging attempt
+# v1.0 - enhanced translation log
 import os
 import time
 import json
@@ -643,8 +643,10 @@ class GCSConnector:
     def translate_with_anthropic(self, source_text, source_language, target_language):
         """Uses Anthropic's Claude to translate text using direct API calls."""
         try:
+            preview_text = source_text[:100] + "..." if len(source_text) > 100 else source_text
             logger.info(f"Translating text with Anthropic", 
-                       extra={"action": "translate", 
+                       extra={"action": "translate",
+                              "Translation input: preview_text,
                               "source_language": source_language, 
                               "target_language": target_language,
                               "text_length": len(source_text)})
@@ -686,8 +688,9 @@ class GCSConnector:
             response_data = response.json()
             result = response_data["content"][0]["text"]
             
+            result_preview = result[:100] + "..." if len(result) > 100 else result
             logger.info(f"Translation complete", 
-                       extra={"action": "translate_success", "result_length": len(result)})
+                       extra={"action": "translate_success", "translation_output": result_preview, "result_length": len(result)})
             
             return result
             
