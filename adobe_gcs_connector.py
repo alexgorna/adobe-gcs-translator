@@ -315,6 +315,7 @@ class GCSConnector:
                     update_url = f"{self.gcs_api_base_url}/projects/{project_id}/tasks/{task_id}/assets/{asset_name}/locales/{target_locale}"
                     update_payload = {
                         "locale": target_locale,
+                        "orgId": self.ims_org_id,
                         "status": "IN_TRANSLATION"
                     }
                     
