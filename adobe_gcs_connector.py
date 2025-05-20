@@ -395,8 +395,8 @@ class GCSConnector:
         """
         Translate XLIFF content using Anthropic's Claude.
         
-        This enhanced function properly handles all translatable elements in the XLIFF file,
-        including headings, titles, and other special elements.
+        This function properly handles all translatable elements in the XLIFF file
+        without including any markup or markers in the final translation.
         """
         try:
             # Parse the XLIFF file
@@ -444,30 +444,27 @@ class GCSConnector:
             
             # Prepare text for translation
             translation_map = {}
-            translation_text = ""
+            segments_to_translate = []
             
             for item in translation_items:
-                marker = f"[#{item['id']}#]"
-                translation_text += f"{marker} {item['text']}\n\n"
-                translation_map[marker] = item
+                # Create a unique identifier that won't appear in the final translation
+                segments_to_translate.append({
+                    "id": item['id'],
+                    "text": item['text']
+                })
+                translation_map[item['id']] = item
             
             # Call Claude API to translate
             prompt = f"""
-            Translate the following text from {source_language} to {target_language}.
+            Translate the following text segments from {source_language} to {target_language}.
             
-            Each segment begins with a marker like [#0#], [#1#], etc. Keep these markers in your response,
-            followed by the translated text.
+            For each segment, provide ONLY the translation without any additional text, markup, or identifiers.
             
-            For example, if you see:
-            [#0#] Hello world
-            
-            And you're translating to French, respond with:
-            [#0#] Bonjour le monde
-            
-            Here's the text to translate:
-            
-            {translation_text}
+            Here are the segments:
             """
+            
+            for segment in segments_to_translate:
+                prompt += f"\n\nSegment {segment['id']}:\n{segment['text']}"
             
             headers = {
                 "x-api-key": self.anthropic_api_key,
@@ -496,8 +493,9 @@ class GCSConnector:
             translated_text = translation_response["content"][0]["text"]
             
             # Process the translated text
-            for marker, item in translation_map.items():
-                pattern = re.compile(rf"{re.escape(marker)}\s*(.*?)(?=\[#\d+#]|\Z)", re.DOTALL)
+            # Look for patterns like "Segment X:" or "Segment X:\n" followed by the translation
+            for segment_id, item in translation_map.items():
+                pattern = re.compile(rf"Segment\s*{segment_id}:?\s*(.*?)(?=Segment\s*\d+:|$)", re.DOTALL)
                 match = pattern.search(translated_text)
                 
                 if match:
