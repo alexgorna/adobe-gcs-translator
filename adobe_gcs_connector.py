@@ -698,15 +698,16 @@ class GCSConnector:
     
     def extract_object_key_from_url(self, url):
         """
-        Extract the object key from an asset URL.
+        Extract the object key from an asset URL or return the path if it's already an object key.
         
-        Example URL format:
-        https://<Storage Account Name>.blob.core.windows.net/gcs/<tenant_id>/<ProjectId>/<TaskId>/normalized/<AssetName>/en-US/<AssetName>.xlf
-        
-        Object key format:
-        <tenant_id>/<ProjectId>/<TaskId>/normalized/<AssetName>/en-US/<AssetName>.xlf
+        Can handle:
+        1. Complete URLs: https://<Storage Account Name>.blob.core.windows.net/gcs/<tenant_id>/...
+        2. Direct object keys: <tenant_id>/<ProjectId>/<TaskId>/normalized/...
         """
-        # This is a simplistic approach - in production, URL parsing would be more robust
+        # Strip any whitespace
+        url = url.strip()
+        
+        # If URL contains the Azure blob storage pattern, extract the path
         if "blob.core.windows.net/gcs/" in url:
             # Split by the common prefix and take everything after it
             object_key = url.split("blob.core.windows.net/gcs/")[1]
@@ -719,7 +720,13 @@ class GCSConnector:
                         extra={"action": "extract_object_key", "url": url, "object_key": object_key})
             return object_key
         
-        # If the URL doesn't match the expected format, return the full URL as fallback
+        # Check if this is already an object key (contains normalized path pattern)
+        if "normalized" in url and "/" in url and not url.startswith("http"):
+            logger.debug(f"URL appears to be a direct object key", 
+                        extra={"action": "extract_object_key_direct", "object_key": url})
+            return url
+        
+        # If the URL doesn't match any expected pattern, log warning and return as is
         logger.warning(f"Could not extract object key from URL", 
                       extra={"action": "extract_object_key_failed", "url": url})
         return url
