@@ -140,7 +140,8 @@ class GCSConnector:
             if self.next_url:
                 url = self.fix_url(self.next_url)
             else:
-                url = f"{self.events_base_url}/{self.journaling_endpoint}?limit=10"
+                # Make sure to include '/events/' in the URL
+                url = f"{self.events_base_url}/events/{self.journaling_endpoint}?limit=10"
             
             logger.info(f"Polling for events: {url}")
             
@@ -395,8 +396,8 @@ class GCSConnector:
         """
         Translate XLIFF content using Anthropic's Claude.
         
-        This function properly handles all translatable elements in the XLIFF file
-        without including any markup or markers in the final translation.
+        This enhanced function properly handles all translatable elements in the XLIFF file,
+        including headings, titles, and other special elements.
         """
         try:
             # Parse the XLIFF file
